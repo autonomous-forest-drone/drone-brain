@@ -1,5 +1,26 @@
 """
-Arm → hover at 1.5m for 3s → land → disarm
+RC-triggered hover mission.
+
+RC ch5 has 3 positions: altitude / position / offboard.
+
+The script streams setpoints at 20 Hz from the start so PX4 can accept an
+OFFBOARD mode switch when the RC gets there (PX4 rejects the switch if there's
+no active setpoint stream).
+
+Switching ch5 to OFFBOARD triggers the mission:
+  - arm
+  - climb to HOVER_ALTITUDE and hold for HOVER_SECONDS
+  - AUTO.LAND (PX4 descends at MPC_LAND_SPEED and cuts motors on touchdown)
+
+Altitude is in the local EKF2 frame — z=0 is ground level at boot time.
+PX4 closes the loop using barometer + IMU fusion; this script just sends the
+target and waits.
+
+After the mission ends the script waits for ch5 to leave OFFBOARD before
+allowing a new run, so it won't restart on its own.
+
+Switching ch5 away from OFFBOARD at any point during the mission hands
+control back to the RC immediately.
 
 Requires MAVROS running:
   ros2 launch mavros px4.launch fcu_url:=/dev/ttyTHS1
@@ -19,23 +40,22 @@ from mavros_msgs.srv import CommandBool, SetMode
 
 HOVER_ALTITUDE = 1.5   # metres
 HOVER_SECONDS  = 3.0
+SETPOINT_HZ    = 20    # publish rate while streaming
 
 
-class HoverTest(Node):
+class HoverMission(Node):
     def __init__(self):
-        super().__init__('hover_test')
+        super().__init__('hover_mission')
 
-        qos_state = QoSProfile(
+        qos = QoSProfile(
             depth=10,
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
 
         self.state = State()
-        self.create_subscription(State, '/mavros/state', self._state_cb, qos_state)
-
-        self.pose_pub = self.create_publisher(PoseStamped, '/mavros/setpoint_position/local', 10)
-
+        self.create_subscription(State, '/mavros/state', self._state_cb, qos)
+        self.pose_pub  = self.create_publisher(PoseStamped, '/mavros/setpoint_position/local', 10)
         self.arm_client  = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.mode_client = self.create_client(SetMode,     '/mavros/set_mode')
 
@@ -43,6 +63,9 @@ class HoverTest(Node):
 
     def _state_cb(self, msg):
         self.state = msg
+
+    def _is_offboard(self):
+        return self.state.mode == 'OFFBOARD'
 
     def _publish_setpoint(self, z):
         msg = PoseStamped()
@@ -59,7 +82,7 @@ class HoverTest(Node):
         future = self.mode_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
         ok = future.result() and future.result().mode_sent
-        self.get_logger().info(f'Set mode {mode}: {"OK" if ok else "FAILED"}')
+        self.get_logger().info(f'SET_MODE {mode}: {"OK" if ok else "FAILED"}')
         return ok
 
     def _arm(self, value):
@@ -69,70 +92,98 @@ class HoverTest(Node):
         future = self.arm_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
         ok = future.result() and future.result().success
-        label = 'ARMED' if value else 'DISARMED'
-        self.get_logger().info(f'{label}: {"OK" if ok else "FAILED"}')
+        self.get_logger().info(f'{"ARM" if value else "DISARM"}: {"OK" if ok else "FAILED"}')
         return ok
 
-    # ------------------------------------------------------------------ main sequence
+    def _spin_hz(self, duration_sec, check_offboard=False):
+        """Spin for duration_sec, publishing setpoints at SETPOINT_HZ.
+        If check_offboard=True, returns False immediately if OFFBOARD is lost."""
+        dt = 1.0 / SETPOINT_HZ
+        end = time.time() + duration_sec
+        while time.time() < end:
+            if check_offboard and not self._is_offboard():
+                return False
+            self._publish_setpoint(HOVER_ALTITUDE)
+            rclpy.spin_once(self, timeout_sec=dt)
+        return True
+
+    # ------------------------------------------------------------------ mission
+
+    def _run_mission(self):
+        self.get_logger().info('OFFBOARD active — arming...')
+        self._arm(True)
+
+        self.get_logger().info(f'Climbing to {HOVER_ALTITUDE} m...')
+        if not self._spin_hz(4.0, check_offboard=True):
+            self.get_logger().info('OFFBOARD lost during ascent — RC has control.')
+            return
+
+        self.get_logger().info(f'Hovering for {HOVER_SECONDS} s...')
+        if not self._spin_hz(HOVER_SECONDS, check_offboard=True):
+            self.get_logger().info('OFFBOARD lost during hover — RC has control.')
+            return
+
+        # Mission complete — land unless RC switches away first
+        self.get_logger().info('Hover complete. Landing...')
+        self._set_mode('AUTO.LAND')
+
+        # Wait until disarmed (landed) or RC takes over
+        while self.state.armed:
+            if not self._is_offboard() and self.state.mode != 'AUTO.LAND':
+                self.get_logger().info('RC has control.')
+                return
+            rclpy.spin_once(self, timeout_sec=1.0 / SETPOINT_HZ)
+
+        self.get_logger().info('Landed and disarmed.')
+
+    # ------------------------------------------------------------------ main loop
 
     def run(self):
         self.get_logger().info('Waiting for MAVROS connection...')
         while not self.state.connected:
             rclpy.spin_once(self, timeout_sec=0.1)
 
-        self.get_logger().info('Connected. Pre-streaming setpoints...')
-        # PX4 requires setpoints to be streaming BEFORE switching to OFFBOARD
-        for _ in range(50):
+        self.get_logger().info(
+            'Connected. Streaming setpoints — switch RC ch5 to OFFBOARD to start mission.'
+        )
+
+        dt = 1.0 / SETPOINT_HZ
+        while True:
+            # Keep streaming so PX4 can enter OFFBOARD the moment the RC switches
             self._publish_setpoint(HOVER_ALTITUDE)
-            time.sleep(0.05)
+            rclpy.spin_once(self, timeout_sec=dt)
 
-        self.get_logger().info('Switching to OFFBOARD mode...')
-        self._set_mode('OFFBOARD')
-        time.sleep(0.5)
-
-        self.get_logger().info('Arming...')
-        self._arm(True)
-        time.sleep(0.5)
-
-        # Keep publishing setpoint during ascent + hover
-        self.get_logger().info(f'Climbing to {HOVER_ALTITUDE}m...')
-        ascent_end = time.time() + 4.0          # allow 4s to reach altitude
-        while time.time() < ascent_end:
-            self._publish_setpoint(HOVER_ALTITUDE)
-            rclpy.spin_once(self, timeout_sec=0.05)
-
-        self.get_logger().info(f'Hovering for {HOVER_SECONDS}s...')
-        hover_end = time.time() + HOVER_SECONDS
-        while time.time() < hover_end:
-            self._publish_setpoint(HOVER_ALTITUDE)
-            rclpy.spin_once(self, timeout_sec=0.05)
-
-        self.get_logger().info('Switching to AUTO.LAND...')
-        self._set_mode('AUTO.LAND')
-
-        # Wait for disarm (PX4 disarms automatically after landing)
-        self.get_logger().info('Waiting for auto-disarm...')
-        timeout = time.time() + 15.0
-        while time.time() < timeout:
-            rclpy.spin_once(self, timeout_sec=0.1)
-            if not self.state.armed:
-                break
-
-        if self.state.armed:
-            self.get_logger().warn('Auto-disarm timed out — disarming manually.')
-            self._arm(False)
-
-        self.get_logger().info('Done.')
+            if self._is_offboard():
+                self._run_mission()
+                if self.state.connected:
+                    self.get_logger().info(
+                        'Mission done. Switch RC ch5 out of OFFBOARD, then back to run again.'
+                    )
+                # Block re-trigger until the user explicitly leaves OFFBOARD
+                while self._is_offboard():
+                    self._publish_setpoint(HOVER_ALTITUDE)
+                    rclpy.spin_once(self, timeout_sec=dt)
 
 
 def main():
+    print("=" * 60)
+    print("RC-triggered hover mission")
+    print()
+    print("Make sure MAVROS is running first:")
+    print("  ros2 launch mavros px4.launch fcu_url:=/dev/ttyTHS1")
+    print()
+    print("RC ch5:  altitude | position | offboard")
+    print("  Switch to OFFBOARD  →  mission starts (arm → climb → hover → land)")
+    print("  Switch back anytime  →  RC takes over immediately")
+    print("=" * 60)
+    print()
+
     rclpy.init()
-    node = HoverTest()
+    node = HoverMission()
     try:
         node.run()
     except KeyboardInterrupt:
-        node.get_logger().info('Interrupted — switching to LAND.')
-        node._set_mode('AUTO.LAND')
+        node.get_logger().info('Interrupted.')
     finally:
         node.destroy_node()
         rclpy.shutdown()
