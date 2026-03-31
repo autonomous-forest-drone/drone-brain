@@ -23,8 +23,7 @@ This repository contains the onboard companion computer software for an autonomo
 drone-brain/
 ├── missions/          # Standalone flight scripts — one file per mission
 ├── helpers/           # Utilities to run alongside missions in separate terminals
-├── docs/              # Documentation for each mission
-└── PX4-Autopilot/     # PX4 SITL submodule (simulation only)
+└── docs/              # Documentation for each mission
 ```
 
 ## Missions
@@ -38,7 +37,7 @@ Each mission is a self-contained script that manages arming, flight, and landing
 
 ### Running a mission
 
-All missions follow the same pattern — start MAVROS first, then the mission script.
+All missions follow the same pattern.
 
 **Real hardware** (all terminals on the Jetson):
 
@@ -131,7 +130,7 @@ python3 helpers/image_sender.py path/to/image.jpg
 1. **Physical connections:**
    - Jetson UART → Pixhawk TELEM2 (57600 baud)
    - Camera CSI connector → Jetson CSI port
-   - Power: 12V input to Jetson from drone battery via buck converter
+   - Power: input to Jetson from drone battery
 
 2. **Pixhawk configuration:**
    - Enable MAVLink on TELEM2: `MAV_1_CONFIG = TELEM2`
@@ -159,21 +158,16 @@ sudo usermod -a -G dialout $USER
 
 ## AirSim settings
 
-AirSim reads `~/Documents/AirSim/settings.json`. Two configs are kept side by side:
+AirSim reads `~/Documents/AirSim/settings.json`. Use the following config:
 
 | File | Used for |
 |---|---|
-| `~/Documents/AirSim/settings.simplflight.json` | PPO training pipeline |
-| `~/Documents/AirSim/settings.px4.json` | PX4 SITL / mission testing |
+| `~airsim/settings.json` | PX4 SITL / mission testing |
 
-Swap before opening AirSim:
+Update before opening AirSim:
 
 ```bash
-# For mission testing
-cp ~/Documents/AirSim/settings.px4.json ~/Documents/AirSim/settings.json
-
-# For training
-cp ~/Documents/AirSim/settings.simplflight.json ~/Documents/AirSim/settings.json
+cp ~/drone-brain/airsim/settings.json ~/Documents/AirSim/settings.px4.json
 ```
 
 ## Related Repositories
