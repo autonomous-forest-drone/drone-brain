@@ -1,5 +1,5 @@
 """
-RC-triggered hover mission.
+RC-triggered hover mission (real hardware) or auto-triggered (AirSim SITL).
 
 RC ch5 has 3 positions: altitude / position / offboard.
 
@@ -22,13 +22,20 @@ allowing a new run, so it won't restart on its own.
 Switching ch5 away from OFFBOARD at any point during the mission hands
 control back to the RC immediately.
 
+--- Real hardware ---
 Requires MAVROS running:
-  ros2 launch mavros px4.launch fcu_url:=/dev/ttyTHS1
-
+  ros2 launch mavros px4.launch fcu_url:=/dev/ttyACM0
 Run:
   python3 hover_test.py
+
+--- AirSim SITL ---
+Requires AirSim (UE5), PX4 SITL, and MAVROS running:
+  ros2 launch mavros px4.launch fcu_url:=udp://:14540@127.0.0.1:14580
+Run:
+  python3 hover_test.py --airsim
 """
 
+import argparse
 import time
 import rclpy
 from rclpy.node import Node
@@ -45,7 +52,7 @@ SETPOINT_HZ    = 20    # publish rate while streaming
 
 class HoverMission(Node):
     def __init__(self):
-        super().__init__('hover_mission')
+        super().__init__('hover_test')
 
         qos = QoSProfile(
             depth=10,
@@ -138,14 +145,21 @@ class HoverMission(Node):
 
     # ------------------------------------------------------------------ main loop
 
-    def run(self):
+    def run(self, airsim=False):
         self.get_logger().info('Waiting for MAVROS connection...')
         while not self.state.connected:
             rclpy.spin_once(self, timeout_sec=0.1)
 
-        self.get_logger().info(
-            'Connected. Streaming setpoints — switch RC ch5 to OFFBOARD to start mission.'
-        )
+        if airsim:
+            self.get_logger().info(
+                'AirSim mode — streaming setpoints for 2 s, then switching to OFFBOARD...'
+            )
+            self._spin_hz(2.0)
+            self._set_mode('OFFBOARD')
+        else:
+            self.get_logger().info(
+                'Connected. Streaming setpoints — switch RC ch5 to OFFBOARD to start mission.'
+            )
 
         dt = 1.0 / SETPOINT_HZ
         while True:
@@ -155,6 +169,9 @@ class HoverMission(Node):
 
             if self._is_offboard():
                 self._run_mission()
+                if airsim:
+                    self.get_logger().info('Simulation mission complete.')
+                    return
                 if self.state.connected:
                     self.get_logger().info(
                         'Mission done. Switch RC ch5 out of OFFBOARD, then back to run again.'
@@ -166,22 +183,41 @@ class HoverMission(Node):
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Hover mission — real hardware or AirSim SITL.')
+    parser.add_argument(
+        '--airsim',
+        action='store_true',
+        help='AirSim/SITL mode: auto-switch to OFFBOARD instead of waiting for RC ch5.',
+    )
+    args = parser.parse_args()
+
     print("=" * 60)
-    print("RC-triggered hover mission")
+    print("Hover mission")
     print()
-    print("Make sure MAVROS is running first:")
-    print("  ros2 launch mavros px4.launch fcu_url:=/dev/ttyTHS1")
-    print()
-    print("RC ch5:  altitude | position | offboard")
-    print("  Switch to OFFBOARD  →  mission starts (arm → climb → hover → land)")
-    print("  Switch back anytime  →  RC takes over immediately")
+    if args.airsim:
+        print("Mode: AirSim simulation")
+        print()
+        print("Required (all on the GCS machine):")
+        print("  1. AirSim/UE5 running with PX4 settings.json")
+        print("  2. PX4 SITL:  make px4_sitl_default none_iris")
+        print("  3. MAVROS:    ros2 launch mavros px4.launch \\")
+        print("                  fcu_url:=udp://:14540@127.0.0.1:14580")
+    else:
+        print("Mode: Real hardware (run everything on the Jetson)")
+        print()
+        print("Required:")
+        print("  MAVROS: ros2 launch mavros px4.launch fcu_url:=/dev/ttyACM0")
+        print()
+        print("RC ch5:  altitude | position | offboard")
+        print("  Switch to OFFBOARD  →  mission starts (arm → climb → hover → land)")
+        print("  Switch back anytime  →  RC takes over immediately")
     print("=" * 60)
     print()
 
     rclpy.init()
     node = HoverMission()
     try:
-        node.run()
+        node.run(airsim=args.airsim)
     except KeyboardInterrupt:
         node.get_logger().info('Interrupted.')
     finally:

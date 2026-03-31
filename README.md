@@ -14,325 +14,167 @@ This repository contains the onboard companion computer software for an autonomo
 
 **Communication:**
 - MAVLink protocol via UART (Jetson ↔ Pixhawk)
-- ROS/MAVROS for flight control abstraction
+- ROS 2 / MAVROS for flight control abstraction
 - Telemetry radio for ground station communication
 
 ## Repository Structure
 
 ```
 drone-brain/
-├── mavros_image_sender/       # Vision processing and image streaming
-├── ros_test/                  # ROS node testing and utilities
-├── scripts/
-│   ├── takeoff_hover.py      # Simple takeoff and hover test
-│   └── autonomous_mission.py  # Autonomous waypoint mission
-├── models/                    # Trained PPO models (download separately)
-├── requirements.txt           # Python dependencies
-└── README.md                  # This file
+├── missions/          # Standalone flight scripts — one file per mission
+├── helpers/           # Utilities to run alongside missions in separate terminals
+├── docs/              # Documentation for each mission
+└── PX4-Autopilot/     # PX4 SITL submodule (simulation only)
 ```
 
-## Features
+## Missions
 
-- **Vision Processing**: Real-time image capture and preprocessing from Arducam IMX477
-- **MAVROS Integration**: ROS wrapper for MAVLink communication with Pixhawk
-- **Autonomous Flight**: Takeoff, hover, waypoint navigation, and landing
-- **PPO Inference**: Real-time obstacle avoidance using trained reinforcement learning model
-- **Safety Features**: Geofencing, battery monitoring, failsafe behaviors
+Each mission is a self-contained script that manages arming, flight, and landing. Full setup and usage instructions for each mission are in `docs/`.
+
+| Script | Description | Docs |
+|---|---|---|
+| `missions/hover_test.py` | Arms, climbs to 1.5 m, hovers for 3 s, lands via `AUTO.LAND`. Triggered by RC ch5 on real hardware or `--airsim` flag in simulation. | [docs/hover_test.md](docs/hover_test.md) |
+| `missions/hover_rc_override.py` | Holds hover by publishing RC override channels. Pilot reclaims control by moving any stick past the threshold. | — |
+
+### Running a mission
+
+All missions follow the same pattern — start MAVROS first, then the mission script.
+
+**Real hardware** (all terminals on the Jetson):
+
+```bash
+# Terminal 1
+ros2 launch mavros px4.launch fcu_url:=/dev/ttyACM0
+
+# Terminal 2
+python3 missions/<mission>.py
+```
+
+**AirSim simulation** (all terminals on the GCS machine — where UE5 and AirSim are installed):
+
+```bash
+# Terminal 1 — PX4 SITL (from PX4-Autopilot/)
+make px4_sitl_default none_iris
+
+# Terminal 2 — MAVROS
+ros2 launch mavros px4.launch fcu_url:=udp://:14540@127.0.0.1:14580
+
+# Terminal 3
+python3 missions/<mission>.py --airsim
+```
+
+See the relevant doc in `docs/` for mission-specific details and what to expect.
+
+## Helpers
+
+Helpers are standalone tools you run in a separate terminal alongside a mission. They do not control flight — they monitor, test, or send data.
+
+---
+
+### `helpers/telemetry_monitor.py`
+
+Live readout of GPS, IMU, or battery data from the Pixhawk via MAVROS.
+
+**Requires MAVROS running.**
+
+```bash
+python3 helpers/telemetry_monitor.py -gps
+python3 helpers/telemetry_monitor.py -imu
+python3 helpers/telemetry_monitor.py -battery
+```
+
+Output updates in place on a single line, e.g.:
+
+```
+🛰  Lat: 55.123456  Lon: 14.654321  Alt: 12.34m  Status: FIX
+```
+
+---
+
+### `helpers/motor_control.py`
+
+Direct motor commands for bench testing. Bypasses the flight controller mixing (group 3 — direct motor control). Useful for verifying motor direction and order without flying.
+
+**Requires MAVROS running.**
+
+```bash
+python3 helpers/motor_control.py manual              # switch to MANUAL mode
+python3 helpers/motor_control.py arm                 # arm the vehicle
+python3 helpers/motor_control.py disarm              # stop motors and disarm
+python3 helpers/motor_control.py spin <throttle>     # spin all motors (0.0–1.0) for 3 s
+python3 helpers/motor_control.py motor <idx> <throttle>  # spin one motor (index 0–7) for 3 s
+python3 helpers/motor_control.py stop                # set all motors to 0
+```
+
+---
+
+### `helpers/image_sender.py`
+
+Captures a frame from the Arducam IMX477 via GStreamer, resizes it to 128×128, and transmits it to the ground station in 128-byte chunks over MAVROS Tunnel messages. Repeats every 20 seconds.
+
+Starts its own MAVROS instance automatically if one is not already running.
+
+```bash
+# Capture from the IMX477 camera
+python3 helpers/image_sender.py
+
+# Send a local image file instead (for testing without hardware)
+python3 helpers/image_sender.py path/to/image.jpg
+```
+
+---
 
 ## Prerequisites
 
-### System Requirements
+### Hardware setup
 
-- NVIDIA Jetson Orin Nano with JetPack 5.1+ (Ubuntu 20.04)
-- Python 3.8+
-- ROS Noetic
-- CUDA 11.4+ (included with JetPack)
-
-### Hardware Setup
-
-1. **Physical Connections:**
+1. **Physical connections:**
    - Jetson UART → Pixhawk TELEM2 (57600 baud)
    - Camera CSI connector → Jetson CSI port
    - Power: 12V input to Jetson from drone battery via buck converter
 
-2. **Pixhawk Configuration:**
+2. **Pixhawk configuration:**
    - Enable MAVLink on TELEM2: `MAV_1_CONFIG = TELEM2`
    - Set baud rate: `SER_TEL2_BAUD = 57600`
-   - Enable companion computer mode: `SYS_COMPANION = Companion Link`
 
-## Installation
+### Software
 
-### 1. Clone Repository
-
-```bash
-cd ~
-git clone https://github.com/forest-drone-rl/onboard-stack.git
-cd onboard-stack
-```
-
-### 2. Install System Dependencies
+- NVIDIA Jetson Orin Nano with JetPack 5.1+ (Ubuntu 22.04)
+- ROS 2 Humble
+- MAVROS for ROS 2
 
 ```bash
-# Update system
-sudo apt update && sudo apt upgrade -y
-
-# Install ROS Noetic (if not already installed)
-sudo sh -c 'echo "deb http://packages.ros.org/ros/ubuntu focal main" > /etc/apt/sources.list.d/ros-latest.list'
-sudo apt install curl
-curl -s https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc | sudo apt-key add -
 sudo apt update
-sudo apt install ros-noetic-desktop-full
-
-# Install MAVROS
-sudo apt install ros-noetic-mavros ros-noetic-mavros-extras
+sudo apt install ros-humble-mavros ros-humble-mavros-extras
 wget https://raw.githubusercontent.com/mavlink/mavros/master/mavros/scripts/install_geographiclib_datasets.sh
 sudo bash ./install_geographiclib_datasets.sh
-
-# Install camera utilities
-sudo apt install v4l-utils python3-opencv
 ```
 
-### 3. Install Python Dependencies
+**UART permissions:**
 
 ```bash
-pip3 install -r requirements.txt
-```
-
-**requirements.txt includes:**
-- `torch` (PyTorch for PPO inference)
-- `torchvision`
-- `opencv-python`
-- `numpy`
-- `pymavlink`
-- `rospy`
-- `stable-baselines3` (PPO implementation)
-
-### 4. Download Trained Models
-
-```bash
-# Models are stored separately due to size
-# Download from release or Google Drive link
-mkdir -p models
-cd models
-wget https://github.com/forest-drone-rl/onboard-stack/releases/download/v1.0/ppo_forest_nav.zip
-unzip ppo_forest_nav.zip
-cd ..
-```
-
-### 5. Configure MAVROS
-
-Edit `config/mavros_config.yaml` to match your setup:
-
-```yaml
-# UART connection to Pixhawk
-fcu_url: "/dev/ttyTHS0:57600"
-gcs_url: ""
-target_system_id: 1
-target_component_id: 1
-```
-
-**Find your UART device:**
-```bash
-ls /dev/ttyTHS*  # For Jetson UART
-# or
-ls /dev/ttyUSB*  # If using USB-to-serial adapter
-```
-
-### 6. Set Permissions
-
-```bash
-# Allow non-root access to UART
 sudo usermod -a -G dialout $USER
-sudo chmod 666 /dev/ttyTHS0
-
-# Reboot for changes to take effect
-sudo reboot
+# Log out and back in for the group change to take effect
 ```
 
-## Usage
+## AirSim settings
 
-### Initialize ROS Environment
+AirSim reads `~/Documents/AirSim/settings.json`. Two configs are kept side by side:
+
+| File | Used for |
+|---|---|
+| `~/Documents/AirSim/settings.simplflight.json` | PPO training pipeline |
+| `~/Documents/AirSim/settings.px4.json` | PX4 SITL / mission testing |
+
+Swap before opening AirSim:
 
 ```bash
-source /opt/ros/noetic/setup.bash
-cd ~/onboard-stack
-source devel/setup.bash  # If using catkin workspace
+# For mission testing
+cp ~/Documents/AirSim/settings.px4.json ~/Documents/AirSim/settings.json
+
+# For training
+cp ~/Documents/AirSim/settings.simplflight.json ~/Documents/AirSim/settings.json
 ```
-
-### 1. Test MAVROS Connection
-
-Start MAVROS and verify connection to Pixhawk:
-
-```bash
-roslaunch mavros px4.launch fcu_url:="/dev/ttyTHS0:57600"
-```
-
-**Verify connection:**
-```bash
-# In another terminal
-rostopic echo /mavros/state
-# Should show: connected: True
-```
-
-### 2. Test Camera
-
-```bash
-# Check camera detection
-v4l2-ctl --list-devices
-
-# Run image sender node
-rosrun mavros_image_sender image_capture.py
-```
-
-### 3. Simple Takeoff and Hover
-
-**⚠️ Safety: Remove propellers for first test, fly in open area**
-
-```bash
-cd ~/onboard-stack/scripts
-python3 takeoff_hover.py
-```
-
-**What it does:**
-1. Arms the drone
-2. Takes off to 2 meters altitude
-3. Hovers for 30 seconds
-4. Lands autonomously
-
-**Parameters (edit in script):**
-- `TARGET_ALTITUDE`: Height in meters (default: 2.0)
-- `HOVER_DURATION`: Time to hover in seconds (default: 30)
-
-### 4. Autonomous Mission
-
-```bash
-python3 autonomous_mission.py
-```
-
-**What it does:**
-1. Arms and takes off
-2. Navigates to predefined waypoints
-3. Uses PPO model for obstacle avoidance
-4. Returns to launch point
-5. Lands
-
-**Mission configuration:**
-Edit waypoints in `autonomous_mission.py`:
-```python
-waypoints = [
-    (47.397742, 8.545594, 5),  # lat, lon, alt (meters)
-    (47.397850, 8.545700, 5),
-    # Add more waypoints
-]
-```
-
-### 5. Run Full Autonomous Navigation Stack
-
-```bash
-# Terminal 1: Start MAVROS
-roslaunch mavros px4.launch fcu_url:="/dev/ttyTHS0:57600"
-
-# Terminal 2: Start vision processing
-rosrun mavros_image_sender vision_node.py
-
-# Terminal 3: Start autonomous navigation
-python3 scripts/autonomous_mission.py --model models/ppo_forest_nav.zip
-```
-
-## Configuration
-
-### Camera Settings
-
-Edit `config/camera_config.yaml`:
-
-```yaml
-camera:
-  width: 640
-  height: 480
-  framerate: 30
-  format: "RGB"
-  
-preprocessing:
-  resize: [128, 128]      # Input size for PPO model
-  normalize: true
-  grayscale: false
-```
-
-### Flight Parameters
-
-Edit in respective scripts or create `config/flight_params.yaml`:
-
-```yaml
-takeoff:
-  altitude: 2.0           # meters
-  ascent_rate: 0.5        # m/s
-  
-navigation:
-  max_speed: 3.0          # m/s
-  obstacle_distance: 5.0  # meters (detection range)
-  safety_margin: 1.5      # meters (minimum clearance)
-  
-landing:
-  descent_rate: 0.3       # m/s
-```
-
-## File Descriptions
-
-### `mavros_image_sender/`
-
-Vision processing module that captures images from the camera and publishes them to ROS topics.
-
-**Key files:**
-- `image_capture.py`: Captures frames from CSI camera
-- `image_preprocessor.py`: Resizes, normalizes for PPO input
-- `vision_node.py`: ROS node for vision pipeline
-
-### `ros_test/`
-
-Testing utilities and example ROS nodes.
-
-**Key files:**
-- `mavlink_test.py`: Test MAVLink connection
-- `topic_monitor.py`: Monitor ROS topics
-- `sensor_check.py`: Verify GPS, IMU, battery data
-
-### `scripts/takeoff_hover.py`
-
-Simple autonomous takeoff and hover script.
-
-**Usage:**
-```bash
-python3 takeoff_hover.py [--altitude 2.0] [--duration 30]
-```
-
-### `scripts/autonomous_mission.py`
-
-Full autonomous mission with PPO-based navigation.
-
-**Usage:**
-```bash
-python3 autonomous_mission.py --model models/ppo_forest_nav.zip --waypoints mission1.yaml
-```
-
-## Safety Features
-
-### Pre-flight Checks
-
-The system performs automatic pre-flight checks:
-- ✅ GPS 3D fix (>10 satellites)
-- ✅ Battery voltage >14.5V (for 4S LiPo)
-- ✅ Pixhawk armed and ready
-- ✅ Camera functional
-- ✅ PPO model loaded successfully
-- ✅ Geofence configured
-
-### Failsafes
-
-- **Low battery**: Automatic return-to-launch (RTL) at 20% remaining
-- **GPS loss**: Hover in place, switch to Altitude mode
-- **Communication loss**: RTL after 10 seconds
-- **Obstacle detection failure**: Immediate landing
-- **Manual RC override**: Always available via transmitter
 
 ## Related Repositories
 
@@ -350,29 +192,10 @@ This is a thesis project by Elina Rosato and Danielis Maizelis (Kristianstad Uni
 
 ## License
 
-Apache 2 License - See LICENSE file for details.
+Apache 2 License — see LICENSE for details.
 
 ## Acknowledgments
 
 - Kristianstad University for resources and support
 - BeetleSense for domain expertise and motivation
 - PX4 and MAVROS communities for open-source flight control tools
-
-## Citation
-
-If you use this work in research, please cite:
-
-```bibtex
-@mastersthesis{rosato2026forest,
-  title={Autonomous Drone Navigation in Forest Environments Using PPO Reinforcement Learning},
-  author={Rosato, Elina and Maizelis, Danielis},
-  year={2026},
-  school={Kristianstad University},
-  address={Kristianstad, Sweden}
-}
-```
-
----
-
-**Last Updated**: March 2026  
-**Version**: 1.0.0

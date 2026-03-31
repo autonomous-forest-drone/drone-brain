@@ -26,7 +26,7 @@ STATUS_MAP = {-1: 'NO FIX', 0: 'FIX', 1: 'SBAS FIX', 2: 'GBAS FIX'}
 
 class DroneDataSubscriber(Node):
     def __init__(self, mode):
-        super().__init__('drone_data_subscriber')
+        super().__init__('telemetry_monitor_subscriber')
         self.mode = mode
 
         # BEST_EFFORT QoS matches mavros sensor topics which don't guarantee delivery
@@ -68,7 +68,7 @@ def main():
 
     # Validate argument — strip leading dashes so both 'gps' and '-gps' work
     if len(sys.argv) < 2 or sys.argv[1].lstrip('-') not in valid_modes:
-        print(f'Usage: python3 drone_data.py -battery | -gps | -imu')
+        print(f'Usage: python3 telemetry_monitor.py -battery | -gps | -imu')
         sys.exit(1)
 
     mode = sys.argv[1].lstrip('-')
