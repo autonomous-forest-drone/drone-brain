@@ -74,24 +74,10 @@ AirSim are installed). Use three separate terminals.
 
 ### AirSim settings
 
-AirSim must be configured for PX4 before launching UE5. Two settings files are
-kept in `~/Documents/AirSim/`:
-
-| File | Used for |
-|---|---|
-| `settings.simplflight.json` | PPO training pipeline |
-| `settings.px4.json` | PX4 SITL / hover_test |
-
-Swap to the PX4 settings before opening AirSim:
+AirSim must be configured for PX4 before launching UE5. Swap to the PX4 settings before opening AirSim:
 
 ```bash
-cp ~/Documents/AirSim/settings.px4.json ~/Documents/AirSim/settings.json
-```
-
-Restore for training afterwards:
-
-```bash
-cp ~/Documents/AirSim/settings.simplflight.json ~/Documents/AirSim/settings.json
+cp ~/drone-brain/airsim/settings.json ~/Documents/AirSim/settings.json
 ```
 
 ### What needs to be running
@@ -122,13 +108,13 @@ INFO  [commander] Ready for takeoff!
 Connects to PX4 SITL over UDP instead of serial:
 
 ```bash
-ros2 launch mavros px4.launch fcu_url:=udp://:14540@127.0.0.1:14580
+ros2 launch mavros px4.launch fcu_url:=udp://:14550@127.0.0.1:18570
 ```
 
 | Port | Role |
 |---|---|
-| `14540` | MAVROS listens — receives telemetry from PX4 SITL |
-| `14580` | PX4 SITL listens — receives commands from MAVROS |
+| `14550` | MAVROS listens — receives telemetry from PX4 SITL |
+| `18570` | PX4 SITL listens — receives commands from MAVROS |
 
 **Terminal 3 — hover_test.py**
 
