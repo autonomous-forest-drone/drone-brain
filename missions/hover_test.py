@@ -62,8 +62,8 @@ class HoverMission(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
 
-        self.state     = State()
-        self.current_z = 0.0
+        self.state        = State()
+        self.current_pose = None
         self.create_subscription(State,       '/mavros/state',              self._state_cb, qos)
         self.create_subscription(PoseStamped, '/mavros/local_position/pose', self._pose_cb,  qos)
         self.pose_pub  = self.create_publisher(PoseStamped, '/mavros/setpoint_position/local', 10)
@@ -76,18 +76,25 @@ class HoverMission(Node):
         self.state = msg
 
     def _pose_cb(self, msg):
-        self.current_z = msg.pose.position.z
+        self.current_pose = msg
 
     def _is_offboard(self):
         return self.state.mode == 'OFFBOARD'
 
-    def _publish_setpoint(self, z):
+    def _publish_setpoint(self, x, y, z):
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.pose.position.x = 0.0
-        msg.pose.position.y = 0.0
+        msg.pose.position.x = x
+        msg.pose.position.y = y
         msg.pose.position.z = z
         self.pose_pub.publish(msg)
+
+    def _setpoint_above_current(self):
+        """Return (x, y, z) for hovering HOVER_ALTITUDE above the current position."""
+        if self.current_pose is None:
+            return 0.0, 0.0, HOVER_ALTITUDE
+        p = self.current_pose.pose.position
+        return p.x, p.y, p.z + HOVER_ALTITUDE
 
     def _set_mode(self, mode):
         self.mode_client.wait_for_service()
@@ -109,25 +116,26 @@ class HoverMission(Node):
         self.get_logger().info(f'{"ARM" if value else "DISARM"}: {"OK" if ok else "FAILED"}')
         return ok
 
-    def _wait_for_altitude(self):
-        """Publish setpoints until current_z is within ALTITUDE_THRESHOLD of HOVER_ALTITUDE.
+    def _wait_for_altitude(self, x, y, target_z):
+        """Publish setpoints until current z is within ALTITUDE_THRESHOLD of target_z.
         Returns False if OFFBOARD is lost or ASCENT_TIMEOUT expires."""
         dt  = 1.0 / SETPOINT_HZ
         end = time.time() + ASCENT_TIMEOUT
         while True:
             if not self._is_offboard():
                 return False
-            if abs(self.current_z - HOVER_ALTITUDE) < ALTITUDE_THRESHOLD:
+            current_z = self.current_pose.pose.position.z if self.current_pose else 0.0
+            if abs(current_z - target_z) < ALTITUDE_THRESHOLD:
                 return True
             if time.time() > end:
                 self.get_logger().warn(
-                    f'Ascent timeout — at {self.current_z:.2f} m, target {HOVER_ALTITUDE} m.'
+                    f'Ascent timeout — at {current_z:.2f} m, target {target_z:.2f} m.'
                 )
                 return False
-            self._publish_setpoint(HOVER_ALTITUDE)
+            self._publish_setpoint(x, y, target_z)
             rclpy.spin_once(self, timeout_sec=dt)
 
-    def _spin_hz(self, duration_sec, check_offboard=False):
+    def _spin_hz(self, duration_sec, x, y, z, check_offboard=False):
         """Spin for duration_sec, publishing setpoints at SETPOINT_HZ.
         If check_offboard=True, returns False immediately if OFFBOARD is lost."""
         dt = 1.0 / SETPOINT_HZ
@@ -135,23 +143,35 @@ class HoverMission(Node):
         while time.time() < end:
             if check_offboard and not self._is_offboard():
                 return False
-            self._publish_setpoint(HOVER_ALTITUDE)
+            self._publish_setpoint(x, y, z)
             rclpy.spin_once(self, timeout_sec=dt)
         return True
 
     # ------------------------------------------------------------------ mission
 
     def _run_mission(self):
+        takeoff_pose = PoseStamped()
+        takeoff_pose.pose.position.x = self.current_pose.pose.position.x
+        takeoff_pose.pose.position.y = self.current_pose.pose.position.y
+        takeoff_pose.pose.position.z = self.current_pose.pose.position.z + HOVER_ALTITUDE
+        tx, ty, tz = (
+            takeoff_pose.pose.position.x,
+            takeoff_pose.pose.position.y,
+            takeoff_pose.pose.position.z,
+        )
+
         self.get_logger().info('OFFBOARD active — arming...')
         self._arm(True)
 
-        self.get_logger().info(f'Climbing to {HOVER_ALTITUDE} m...')
-        if not self._wait_for_altitude():
+        self.get_logger().info(
+            f'Climbing to {tz:.2f} m (current + {HOVER_ALTITUDE} m)...'
+        )
+        if not self._wait_for_altitude(tx, ty, tz):
             self.get_logger().info('Ascent aborted — RC has control.')
             return
 
         self.get_logger().info(f'Hovering for {HOVER_SECONDS} s...')
-        if not self._spin_hz(HOVER_SECONDS, check_offboard=True):
+        if not self._spin_hz(HOVER_SECONDS, tx, ty, tz, check_offboard=True):
             self.get_logger().info('OFFBOARD lost during hover — RC has control.')
             return
 
@@ -179,7 +199,7 @@ class HoverMission(Node):
             self.get_logger().info(
                 'AirSim mode — streaming setpoints for 2 s, then switching to OFFBOARD...'
             )
-            self._spin_hz(2.0)
+            self._spin_hz(2.0, *self._setpoint_above_current())
             self._set_mode('OFFBOARD')
         else:
             self.get_logger().info(
@@ -189,7 +209,7 @@ class HoverMission(Node):
         dt = 1.0 / SETPOINT_HZ
         while True:
             # Keep streaming so PX4 can enter OFFBOARD the moment the RC switches
-            self._publish_setpoint(HOVER_ALTITUDE)
+            self._publish_setpoint(*self._setpoint_above_current())
             rclpy.spin_once(self, timeout_sec=dt)
 
             if self._is_offboard():
@@ -203,7 +223,7 @@ class HoverMission(Node):
                     )
                 # Block re-trigger until the user explicitly leaves OFFBOARD
                 while self._is_offboard():
-                    self._publish_setpoint(HOVER_ALTITUDE)
+                    self._publish_setpoint(*self._setpoint_above_current())
                     rclpy.spin_once(self, timeout_sec=dt)
 
 
