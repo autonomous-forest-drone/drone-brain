@@ -141,9 +141,9 @@ class LandOnKey(Node):
         self.land_client.wait_for_service()
         req = CommandTOL.Request()
         req.min_pitch = 0.0
-        req.yaw = 0.0
-        req.latitude = 0.0
-        req.longitude = 0.0
+        req.yaw = float('nan')
+        req.latitude = self.gps.latitude
+        req.longitude = self.gps.longitude
         req.altitude = 0.0
         future = self.land_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
