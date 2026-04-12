@@ -17,7 +17,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from mavros_msgs.msg import State, StatusText
-from mavros_msgs.srv import CommandLong
+from mavros_msgs.srv import CommandTOL
 from sensor_msgs.msg import NavSatFix
 from geometry_msgs.msg import PoseStamped
 
@@ -46,7 +46,7 @@ class LandOnKey(Node):
         self.create_subscription(PoseStamped, '/mavros/local_position/pose',
             lambda msg: setattr(self, '_local_pos_received_at', time.monotonic()), qos)
         self.create_subscription(StatusText, '/mavros/statustext', self._on_statustext, qos)
-        self.cmd_client = self.create_client(CommandLong, '/mavros/cmd/command')
+        self.cmd_client = self.create_client(CommandTOL, '/mavros/cmd/land')
 
     def _on_state(self, msg: State):
         self.state = msg
@@ -134,18 +134,15 @@ class LandOnKey(Node):
         if not self._wait_for_local_position():
             return False
         self.cmd_client.wait_for_service()
-        req = CommandLong.Request()
-        req.command = 176   # MAV_CMD_DO_SET_MODE
-        req.param1  = float(0x01 | (0x80 if self.state.armed else 0))  # base_mode
-        req.param2  = 4.0   # PX4_CUSTOM_MAIN_MODE_AUTO
-        req.param3  = 6.0   # PX4_CUSTOM_SUB_MODE_AUTO_LAND
+        req = CommandTOL.Request()
+        # all fields default to 0 — land at current position
         future = self.cmd_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
         result = future.result() if future.done() else None
         if result and result.success:
-            self.get_logger().info('MAV_CMD_DO_SET_MODE: ACK received')
+            self.get_logger().info('cmd/land: ACK received')
         else:
-            self.get_logger().warn('MAV_CMD_DO_SET_MODE: no ACK — checking mode anyway')
+            self.get_logger().warn('cmd/land: no ACK — checking mode anyway')
         # mode_sent is unreliable — the mode flip is the authoritative check.
         # HEARTBEAT publishes at ~1 Hz so wait long enough to see several cycles.
         deadline = self.get_clock().now().nanoseconds + int(_LAND_VERIFY_TIMEOUT * 1e9)
