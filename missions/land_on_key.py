@@ -21,7 +21,6 @@ from mavros_msgs.srv import SetMode
 from sensor_msgs.msg import NavSatFix
 from geometry_msgs.msg import PoseStamped
 
-_LAND_RETRIES = 5
 _LAND_VERIFY_TIMEOUT = 4.0   # seconds to wait for mode flip after ACK (HEARTBEAT is ~1 Hz)
 _EKF_WAIT_TIMEOUT   = 30.0  # seconds to wait for EKF local position before giving up
 _GPS_FIX_TIMEOUT = 30.0  # seconds to wait for GPS fix before giving up
@@ -41,15 +40,23 @@ class LandOnKey(Node):
         self.gps = NavSatFix()
         self.gps.status.status = -1  # NavSatStatus.STATUS_NO_FIX
         self._local_pos_received_at = 0.0  # wall-clock time of last local_position/pose msg
-        self.create_subscription(State, '/mavros/state', lambda msg: setattr(self, 'state', msg), qos)
+        self._state_received_at = 0.0      # wall-clock time of last /mavros/state msg
+        self.create_subscription(State, '/mavros/state', self._on_state, qos)
         self.create_subscription(NavSatFix, '/mavros/global_position/raw/fix', lambda msg: setattr(self, 'gps', msg), qos)
         self.create_subscription(PoseStamped, '/mavros/local_position/pose',
             lambda msg: setattr(self, '_local_pos_received_at', time.monotonic()), qos)
         self.create_subscription(StatusText, '/mavros/statustext', self._on_statustext, qos)
         self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
 
+    def _on_state(self, msg: State):
+        self.state = msg
+        self._state_received_at = time.monotonic()
+
     def _on_statustext(self, msg: StatusText):
         self.get_logger().info(f'[PX4] {msg.text}')
+
+    def _has_fresh_state(self, max_age: float = 1.5) -> bool:
+        return self._state_received_at > 0 and time.monotonic() - self._state_received_at < max_age
 
     def _has_gps_fix(self):
         # NavSatStatus: -1=no fix, 0=fix, 1=SBAS, 2=GBAS
@@ -116,6 +123,12 @@ class LandOnKey(Node):
             f'gps_fix={"YES" if self._has_gps_fix() else "NO"} '
             f'ekf_local_pos={"YES" if self._has_local_position() else "NO"}'
         )
+        if not self._has_fresh_state():
+            self.get_logger().error(
+                'State message is stale (>1.5s since last update) — '
+                'FCU may have disconnected. Aborting land.'
+            )
+            return False
         if not self._wait_for_gps():
             return False
         if not self._wait_for_local_position():
@@ -123,29 +136,21 @@ class LandOnKey(Node):
         self.mode_client.wait_for_service()
         req = SetMode.Request()
         req.custom_mode = 'AUTO.LAND'
-        for attempt in range(1, _LAND_RETRIES + 1):
-            future = self.mode_client.call_async(req)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
-            result = future.result() if future.done() else None
-            if result and result.mode_sent:
-                self.get_logger().info(f'SET_MODE AUTO.LAND: ACK received (attempt {attempt})')
-            else:
-                self.get_logger().warn(
-                    f'SET_MODE AUTO.LAND: no ACK (attempt {attempt}/{_LAND_RETRIES})'
-                    + (' — checking mode anyway' if attempt < _LAND_RETRIES else '')
-                )
-            # mode_sent is unreliable — the mode flip is the authoritative check.
-            # HEARTBEAT publishes at ~1 Hz so wait long enough to see several cycles.
-            deadline = self.get_clock().now().nanoseconds + int(_LAND_VERIFY_TIMEOUT * 1e9)
-            while self.state.mode != 'AUTO.LAND' and self.get_clock().now().nanoseconds < deadline:
-                rclpy.spin_once(self, timeout_sec=0.1)
-            if self.state.mode == 'AUTO.LAND':
-                self.get_logger().info(f'SET_MODE AUTO.LAND: confirmed (attempt {attempt})')
-                return True
-            if attempt < _LAND_RETRIES:
-                self.get_logger().warn(
-                    f'SET_MODE AUTO.LAND: mode did not flip (attempt {attempt}/{_LAND_RETRIES}) — retrying'
-                )
+        future = self.mode_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
+        result = future.result() if future.done() else None
+        if result and result.mode_sent:
+            self.get_logger().info('SET_MODE AUTO.LAND: ACK received')
+        else:
+            self.get_logger().warn('SET_MODE AUTO.LAND: no ACK — checking mode anyway')
+        # mode_sent is unreliable — the mode flip is the authoritative check.
+        # HEARTBEAT publishes at ~1 Hz so wait long enough to see several cycles.
+        deadline = self.get_clock().now().nanoseconds + int(_LAND_VERIFY_TIMEOUT * 1e9)
+        while self.state.mode != 'AUTO.LAND' and self.get_clock().now().nanoseconds < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if self.state.mode == 'AUTO.LAND':
+            self.get_logger().info('SET_MODE AUTO.LAND: confirmed')
+            return True
         return False
 
     def run(self):
