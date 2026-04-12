@@ -17,11 +17,11 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from mavros_msgs.msg import State, StatusText
-from mavros_msgs.srv import CommandTOL
+from mavros_msgs.srv import SetMode
 from sensor_msgs.msg import NavSatFix
 from geometry_msgs.msg import PoseStamped
 
-_LAND_VERIFY_TIMEOUT = 4.0   # seconds to wait for mode flip after ACK (HEARTBEAT is ~1 Hz)
+_LAND_VERIFY_TIMEOUT = 10.0  # seconds to wait for mode flip after AUTO.LAND command
 _EKF_WAIT_TIMEOUT   = 30.0  # seconds to wait for EKF local position before giving up
 _GPS_FIX_TIMEOUT = 30.0  # seconds to wait for GPS fix before giving up
 
@@ -51,7 +51,7 @@ class LandOnKey(Node):
         self.create_subscription(PoseStamped, '/mavros/local_position/pose',
             lambda msg: setattr(self, '_local_pos_received_at', time.monotonic()), qos)
         self.create_subscription(StatusText, '/mavros/statustext', self._on_statustext, qos)
-        self.cmd_client = self.create_client(CommandTOL, '/mavros/cmd/land')
+        self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
 
     def _on_state(self, msg: State):
         self.state = msg
@@ -132,20 +132,19 @@ class LandOnKey(Node):
             return False
         if not self._wait_for_local_position():
             return False
-        self.cmd_client.wait_for_service()
-        req = CommandTOL.Request()
-        # all fields default to 0 — land at current position
-        future = self.cmd_client.call_async(req)
+        self.mode_client.wait_for_service()
+        req = SetMode.Request()
+        req.custom_mode = 'AUTO.LAND'
+        future = self.mode_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
         result = future.result() if future.done() else None
-        if result and result.success:
-            self.get_logger().info('cmd/land: ACK received')
+        if result and result.mode_sent:
+            self.get_logger().info('SET_MODE AUTO.LAND: ACK received')
         else:
-            self.get_logger().warn('cmd/land: no ACK — checking mode anyway')
-        # mode_sent is unreliable — the mode flip is the authoritative check.
+            self.get_logger().warn('SET_MODE AUTO.LAND: no ACK — checking mode anyway')
         # HEARTBEAT publishes at ~1 Hz so wait long enough to see several cycles.
-        deadline = self.get_clock().now().nanoseconds + int(_LAND_VERIFY_TIMEOUT * 1e9)
-        while self.state.mode != 'AUTO.LAND' and self.get_clock().now().nanoseconds < deadline:
+        deadline = time.monotonic() + _LAND_VERIFY_TIMEOUT
+        while self.state.mode != 'AUTO.LAND' and time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
         if self.state.mode == 'AUTO.LAND':
             self.get_logger().info('SET_MODE AUTO.LAND: confirmed')
@@ -163,7 +162,7 @@ class LandOnKey(Node):
         if not self.state.connected:
             self.get_logger().info('MAVROS not connected — launching...')
             subprocess.Popen(
-                ['ros2', 'launch', 'mavros', 'px4.launch', 'fcu_url:=/dev/ttyTHS1:921600'],
+                ['ros2', 'launch', 'mavros', 'px4.launch', 'fcu_url:=/dev/ttyTHS1:115200'],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -191,16 +190,7 @@ class LandOnKey(Node):
 
         self.get_logger().info('Key received — switching to AUTO.LAND...')
         if not self._land():
-            self.get_logger().error('Failed to set AUTO.LAND.')
-            return
-
-        # Wait for the mode to reflect AUTO.LAND
-        deadline = self.get_clock().now().nanoseconds + int(5.0 * 1e9)
-        while self.state.mode != 'AUTO.LAND' and self.get_clock().now().nanoseconds < deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
-
-        if self.state.mode != 'AUTO.LAND':
-            self.get_logger().error(f'Mode did not switch — still in {self.state.mode}')
+            self.get_logger().error('Failed to set AUTO.LAND — disarm manually via RC.')
             return
 
         self.get_logger().info('AUTO.LAND confirmed. Waiting until disarmed...')
