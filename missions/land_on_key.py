@@ -17,7 +17,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from mavros_msgs.msg import State, StatusText
-from mavros_msgs.srv import SetMode
+from mavros_msgs.srv import CommandLong
 from sensor_msgs.msg import NavSatFix
 from geometry_msgs.msg import PoseStamped
 
@@ -46,7 +46,7 @@ class LandOnKey(Node):
         self.create_subscription(PoseStamped, '/mavros/local_position/pose',
             lambda msg: setattr(self, '_local_pos_received_at', time.monotonic()), qos)
         self.create_subscription(StatusText, '/mavros/statustext', self._on_statustext, qos)
-        self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
+        self.cmd_client = self.create_client(CommandLong, '/mavros/cmd/command')
 
     def _on_state(self, msg: State):
         self.state = msg
@@ -133,22 +133,19 @@ class LandOnKey(Node):
             return False
         if not self._wait_for_local_position():
             return False
-        self.mode_client.wait_for_service()
-        req = SetMode.Request()
-        req.custom_mode = 'AUTO.LAND'
-        # base_mode must preserve the SAFETY_ARMED flag (bit 7). If it is absent,
-        # PX4 treats the command as "switch mode AND disarm", which it rejects
-        # mid-flight — causing a silent ACK with no actual mode change.
-        _CUSTOM_MODE = 0x01   # MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
-        _ARMED       = 0x80   # MAV_MODE_FLAG_SAFETY_ARMED
-        req.base_mode = _CUSTOM_MODE | (_ARMED if self.state.armed else 0)
-        future = self.mode_client.call_async(req)
+        self.cmd_client.wait_for_service()
+        req = CommandLong.Request()
+        req.command = 176   # MAV_CMD_DO_SET_MODE
+        req.param1  = float(0x01 | (0x80 if self.state.armed else 0))  # base_mode
+        req.param2  = 4.0   # PX4_CUSTOM_MAIN_MODE_AUTO
+        req.param3  = 6.0   # PX4_CUSTOM_SUB_MODE_AUTO_LAND
+        future = self.cmd_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
         result = future.result() if future.done() else None
-        if result and result.mode_sent:
-            self.get_logger().info('SET_MODE AUTO.LAND: ACK received')
+        if result and result.success:
+            self.get_logger().info('MAV_CMD_DO_SET_MODE: ACK received')
         else:
-            self.get_logger().warn('SET_MODE AUTO.LAND: no ACK — checking mode anyway')
+            self.get_logger().warn('MAV_CMD_DO_SET_MODE: no ACK — checking mode anyway')
         # mode_sent is unreliable — the mode flip is the authoritative check.
         # HEARTBEAT publishes at ~1 Hz so wait long enough to see several cycles.
         deadline = self.get_clock().now().nanoseconds + int(_LAND_VERIFY_TIMEOUT * 1e9)
