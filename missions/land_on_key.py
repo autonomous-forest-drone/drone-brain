@@ -35,13 +35,18 @@ class LandOnKey(Node):
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
+        state_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
 
         self.state = State()
         self.gps = NavSatFix()
         self.gps.status.status = -1  # NavSatStatus.STATUS_NO_FIX
         self._local_pos_received_at = 0.0  # wall-clock time of last local_position/pose msg
         self._state_received_at = 0.0      # wall-clock time of last /mavros/state msg
-        self.create_subscription(State, '/mavros/state', self._on_state, qos)
+        self.create_subscription(State, '/mavros/state', self._on_state, state_qos)
         self.create_subscription(NavSatFix, '/mavros/global_position/raw/fix', lambda msg: setattr(self, 'gps', msg), qos)
         self.create_subscription(PoseStamped, '/mavros/local_position/pose',
             lambda msg: setattr(self, '_local_pos_received_at', time.monotonic()), qos)
