@@ -17,7 +17,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from mavros_msgs.msg import State, StatusText
-from mavros_msgs.srv import SetMode
+from mavros_msgs.srv import CommandTOL, SetMode
 from sensor_msgs.msg import NavSatFix
 from geometry_msgs.msg import PoseStamped
 
@@ -51,6 +51,7 @@ class LandOnKey(Node):
         self.create_subscription(PoseStamped, '/mavros/local_position/pose',
             lambda msg: setattr(self, '_local_pos_received_at', time.monotonic()), qos)
         self.create_subscription(StatusText, '/mavros/statustext', self._on_statustext, qos)
+        self.land_client = self.create_client(CommandTOL, '/mavros/cmd/land')
         self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
 
     def _on_state(self, msg: State):
@@ -132,22 +133,59 @@ class LandOnKey(Node):
             return False
         if not self._wait_for_local_position():
             return False
-        self.mode_client.wait_for_service()
-        req = SetMode.Request()
-        req.custom_mode = 'AUTO.LAND'
-        future = self.mode_client.call_async(req)
+
+        # Use cmd/land (MAV_CMD_NAV_LAND) — same as QGC's Land button.
+        # This is a navigation command and is not overridden by the RC mode switch,
+        # unlike SET_MODE which channel-5 ALTCTL immediately cancels.
+        self.get_logger().info('Sending MAV_CMD_NAV_LAND via /mavros/cmd/land ...')
+        self.land_client.wait_for_service()
+        req = CommandTOL.Request()
+        req.min_pitch = 0.0
+        req.yaw = 0.0
+        req.latitude = 0.0
+        req.longitude = 0.0
+        req.altitude = 0.0
+        future = self.land_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
         result = future.result() if future.done() else None
-        if result and result.mode_sent:
-            self.get_logger().info('SET_MODE AUTO.LAND: ACK received')
+        if result and result.success:
+            self.get_logger().info('cmd/land: ACK success')
         else:
-            self.get_logger().warn('SET_MODE AUTO.LAND: no ACK — checking mode anyway')
-        # HEARTBEAT publishes at ~1 Hz so wait long enough to see several cycles.
+            # PX4 often routes COMMAND_ACK to TELEM1 (QGC) instead of TELEM2
+            # (MAVROS). The command may still execute — fall through and check
+            # the mode rather than bailing out here.
+            self.get_logger().warn(
+                'cmd/land: no ACK or result=False — '
+                'PX4 may have routed ACK to QGC. Checking mode anyway...'
+            )
+
+        # HEARTBEAT is ~1 Hz; wait long enough to see several cycles.
         deadline = time.monotonic() + _LAND_VERIFY_TIMEOUT
         while self.state.mode != 'AUTO.LAND' and time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
         if self.state.mode == 'AUTO.LAND':
-            self.get_logger().info('SET_MODE AUTO.LAND: confirmed')
+            self.get_logger().info('AUTO.LAND mode confirmed.')
+            return True
+
+        # Fallback: try SET_MODE in case cmd/land was rejected.
+        self.get_logger().warn(
+            'cmd/land did not result in AUTO.LAND — falling back to SET_MODE...'
+        )
+        self.mode_client.wait_for_service()
+        mode_req = SetMode.Request()
+        mode_req.custom_mode = 'AUTO.LAND'
+        mode_future = self.mode_client.call_async(mode_req)
+        rclpy.spin_until_future_complete(self, mode_future, timeout_sec=3.0)
+        mode_result = mode_future.result() if mode_future.done() else None
+        if mode_result and mode_result.mode_sent:
+            self.get_logger().info('SET_MODE AUTO.LAND: ACK received')
+        else:
+            self.get_logger().warn('SET_MODE AUTO.LAND: no ACK — checking mode anyway')
+        deadline = time.monotonic() + _LAND_VERIFY_TIMEOUT
+        while self.state.mode != 'AUTO.LAND' and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if self.state.mode == 'AUTO.LAND':
+            self.get_logger().info('AUTO.LAND mode confirmed (via SET_MODE fallback).')
             return True
         return False
 
