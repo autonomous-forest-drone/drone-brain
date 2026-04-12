@@ -123,12 +123,6 @@ class LandOnKey(Node):
             f'gps_fix={"YES" if self._has_gps_fix() else "NO"} '
             f'ekf_local_pos={"YES" if self._has_local_position() else "NO"}'
         )
-        if not self._has_fresh_state():
-            self.get_logger().error(
-                'State message is stale (>1.5s since last update) — '
-                'FCU may have disconnected. Aborting land.'
-            )
-            return False
         if not self._wait_for_gps():
             return False
         if not self._wait_for_local_position():
