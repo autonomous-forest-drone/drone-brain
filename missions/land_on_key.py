@@ -136,6 +136,12 @@ class LandOnKey(Node):
         self.mode_client.wait_for_service()
         req = SetMode.Request()
         req.custom_mode = 'AUTO.LAND'
+        # base_mode must preserve the SAFETY_ARMED flag (bit 7). If it is absent,
+        # PX4 treats the command as "switch mode AND disarm", which it rejects
+        # mid-flight — causing a silent ACK with no actual mode change.
+        _CUSTOM_MODE = 0x01   # MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+        _ARMED       = 0x80   # MAV_MODE_FLAG_SAFETY_ARMED
+        req.base_mode = _CUSTOM_MODE | (_ARMED if self.state.armed else 0)
         future = self.mode_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
         result = future.result() if future.done() else None
@@ -192,7 +198,7 @@ class LandOnKey(Node):
 
         self.get_logger().info('Key received — switching to AUTO.LAND...')
         if not self._land():
-            self.get_logger().error('Failed to set AUTO.LAND after all retries.')
+            self.get_logger().error('Failed to set AUTO.LAND.')
             return
 
         # Wait for the mode to reflect AUTO.LAND
