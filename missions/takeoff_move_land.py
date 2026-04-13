@@ -62,6 +62,11 @@ class TakeoffMoveLand(Node):
         self.state         = State()
         self.gps_latitude  = 0.0
         self.gps_longitude = 0.0
+        # Latch: becomes True once we've seen a non-RC mode during the mission.
+        # Only after that can a return to POSCTL/ALTCTL be a genuine pilot takeover.
+        # This prevents POSCTL (set by _set_posctl at end of previous run) from
+        # immediately tripping the override check before AUTO.TAKEOFF is confirmed.
+        self._left_rc_modes = False
         self.create_subscription(State,      '/mavros/state',      self._on_state,      state_qos)
         self.create_subscription(StatusText, '/mavros/statustext', self._on_statustext, qos)
 
@@ -80,7 +85,10 @@ class TakeoffMoveLand(Node):
         self.get_logger().info(f'[PX4] {msg.text}')
 
     def _rc_override(self):
-        return self.state.mode in RC_OVERRIDE_MODES
+        if self.state.mode not in RC_OVERRIDE_MODES:
+            self._left_rc_modes = True
+            return False
+        return self._left_rc_modes
 
     def _publish_vel(self, vx: float = 0.0, vy: float = 0.0, vz: float = 0.0):
         """Publish velocity in body frame: x=forward, y=left, z=up."""
@@ -236,6 +244,8 @@ class TakeoffMoveLand(Node):
 
     def run(self):
         dt = 1.0 / SETPOINT_HZ
+
+        self._left_rc_modes = False  # reset latch for this run
 
         # ---- MAVROS connection ----
         deadline = time.monotonic() + 2.0
