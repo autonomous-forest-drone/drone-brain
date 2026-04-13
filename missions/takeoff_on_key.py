@@ -90,7 +90,7 @@ class TakeoffOnKey(Node):
                 req.yaw = 0.0
                 req.latitude = 0.0
                 req.longitude = 0.0
-                req.altitude = 0.0  # PX4 uses MIS_TAKEOFF_ALT from QGC
+                req.altitude = 1.0  # PX4 uses MIS_TAKEOFF_ALT from QGC
                 future = self.takeoff_client.call_async(req)
                 rclpy.spin_until_future_complete(self, future, timeout_sec=1.0)
                 result = future.result() if future.done() else None
