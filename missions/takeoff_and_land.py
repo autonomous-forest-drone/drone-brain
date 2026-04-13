@@ -108,9 +108,6 @@ class TakeoffAndLand(Node):
                     self.get_logger().warn('SET_MODE AUTO.TAKEOFF: no ACK — retrying...')
                 last_send = time.monotonic()
             rclpy.spin_once(self, timeout_sec=0.1)
-            if self._rc_override():
-                self.get_logger().info(f'RC override ({self.state.mode}) — handing off.')
-                return None
             if self.state.mode == 'AUTO.TAKEOFF':
                 self.get_logger().info('AUTO.TAKEOFF mode confirmed.')
                 return True
