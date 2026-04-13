@@ -20,7 +20,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from mavros_msgs.msg import State, StatusText
-from mavros_msgs.srv import CommandBool, CommandTOL
+from mavros_msgs.srv import CommandBool, SetMode
 
 
 _CMD_INTERVAL  = 2.0   # seconds between command retries
@@ -46,8 +46,8 @@ class TakeoffOnKey(Node):
         self.state = State()
         self.create_subscription(State, '/mavros/state', self._on_state, state_qos)
         self.create_subscription(StatusText, '/mavros/statustext', self._on_statustext, qos)
-        self.arm_client    = self.create_client(CommandBool, '/mavros/cmd/arming')
-        self.takeoff_client = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
+        self.arm_client  = self.create_client(CommandBool, '/mavros/cmd/arming')
+        self.mode_client = self.create_client(SetMode,     '/mavros/set_mode')
 
     def _on_state(self, msg: State):
         self.state = msg
@@ -80,29 +80,28 @@ class TakeoffOnKey(Node):
 
     def _takeoff(self):
         self.get_logger().info('Commanding AUTO.TAKEOFF — will retry until mode confirms...')
-        self.takeoff_client.wait_for_service()
+        self.mode_client.wait_for_service()
         deadline = time.monotonic() + _TAKEOFF_TIMEOUT
         last_send = 0.0
         while time.monotonic() < deadline:
             if time.monotonic() - last_send >= _CMD_INTERVAL:
-                req = CommandTOL.Request()
-                req.min_pitch = 0.0
-                req.yaw = 0.0
-                req.latitude = 0.0
-                req.longitude = 0.0
-                req.altitude = 1.0  # PX4 uses MIS_TAKEOFF_ALT from QGC
-                future = self.takeoff_client.call_async(req)
+                req = SetMode.Request()
+                req.custom_mode = 'AUTO.TAKEOFF'
+                future = self.mode_client.call_async(req)
                 rclpy.spin_until_future_complete(self, future, timeout_sec=1.0)
                 result = future.result() if future.done() else None
-                if result and result.success:
-                    self.get_logger().info('cmd/takeoff: ACK success')
+                if result and result.mode_sent:
+                    self.get_logger().info('SET_MODE AUTO.TAKEOFF: ACK success')
                 else:
-                    self.get_logger().warn('cmd/takeoff: no ACK — retrying...')
+                    self.get_logger().warn('SET_MODE AUTO.TAKEOFF: no ACK — retrying...')
                 last_send = time.monotonic()
             rclpy.spin_once(self, timeout_sec=0.1)
             if self.state.mode == 'AUTO.TAKEOFF':
                 self.get_logger().info('AUTO.TAKEOFF mode confirmed.')
                 return True
+            if not self.state.armed:
+                self.get_logger().error('Drone disarmed before takeoff confirmed — aborting.')
+                return False
         return False
 
     def run(self):
