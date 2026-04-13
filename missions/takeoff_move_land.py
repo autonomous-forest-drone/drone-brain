@@ -166,26 +166,30 @@ class TakeoffMoveLand(Node):
         return False
 
     def _land(self):
-        """Switch to AUTO.LAND while keeping the velocity stream alive."""
-        self.get_logger().info('Commanding AUTO.LAND — will retry until mode confirms...')
-        self.mode_client.wait_for_service()
-        dt        = 1.0 / SETPOINT_HZ
+        """Stop velocity stream and command AUTO.LAND via cmd/land."""
+        # Stop publishing setpoints — PX4 exits OFFBOARD automatically when
+        # the stream stops, then cmd/land (MAV_CMD_NAV_LAND) can take hold.
+        self.get_logger().info('Stopping velocity stream and commanding AUTO.LAND...')
+        self.land_client.wait_for_service()
         deadline  = time.monotonic() + _LAND_TIMEOUT
         last_send = 0.0
         while time.monotonic() < deadline:
-            self._publish_vel()                          # keep OFFBOARD alive during switch
             if time.monotonic() - last_send >= _CMD_INTERVAL:
-                req             = SetMode.Request()
-                req.custom_mode = 'AUTO.LAND'
-                future          = self.mode_client.call_async(req)
+                req           = CommandTOL.Request()
+                req.min_pitch = 0.0
+                req.yaw       = float('nan')
+                req.latitude  = self.gps_latitude
+                req.longitude = self.gps_longitude
+                req.altitude  = 0.0
+                future = self.land_client.call_async(req)
                 rclpy.spin_until_future_complete(self, future, timeout_sec=1.0)
                 result = future.result() if future.done() else None
-                if result and result.mode_sent:
-                    self.get_logger().info('SET_MODE AUTO.LAND: ACK success')
+                if result and result.success:
+                    self.get_logger().info('cmd/land: ACK success')
                 else:
-                    self.get_logger().warn('SET_MODE AUTO.LAND: no ACK — retrying...')
+                    self.get_logger().warn('cmd/land: no ACK — retrying...')
                 last_send = time.monotonic()
-            rclpy.spin_once(self, timeout_sec=dt)
+            rclpy.spin_once(self, timeout_sec=0.1)
             if self.state.mode == 'AUTO.LAND':
                 self.get_logger().info('AUTO.LAND mode confirmed.')
                 return True
