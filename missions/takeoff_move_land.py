@@ -25,7 +25,7 @@ from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
 
 
 FORWARD_SPEED   = 1.0   # m/s — body x (forward)
-MOVE_TIME       = 1.0   # seconds → ~1 m
+MOVE_TIME       = 2.0   # seconds → ~1 m
 PRESTREAM_TIME  = 2.0   # seconds to stream zeros before switching to OFFBOARD
 SETPOINT_HZ     = 20    # Hz — must stay >2 Hz or PX4 exits OFFBOARD
 
