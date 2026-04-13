@@ -1,13 +1,13 @@
 """
 Waits for any key press, then arms and commands AUTO.TAKEOFF. PX4 climbs to
-the altitude configured in QGroundControl (MIS_TAKEOFF_ALT). Once the takeoff
-is complete the script immediately commands AUTO.LAND and waits until disarmed.
+the altitude configured in QGroundControl (MIS_TAKEOFF_ALT). The drone hovers
+for HOVER_TIME seconds, then commands AUTO.LAND and waits until disarmed.
 
-RC override: switching to ALTCTL or POSCTL at any point during the mission
-hands control back to the RC immediately and the script exits.
+RC override: switching to ALTCTL or POSCTL at any point hands control back
+to the RC immediately and the script exits.
 
 Requires MAVROS running:
-  ros2 launch mavros px4.launch fcu_url:=/dev/ttyTHS1:921600
+  ros2 launch mavros px4.launch fcu_url:=/dev/ttyTHS1:115200
 Run:
   python3 takeoff_and_land.py
 """
@@ -16,18 +16,22 @@ import select
 import subprocess
 import sys
 import termios
+import time
 import tty
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
-from mavros_msgs.msg import State
-from mavros_msgs.srv import CommandBool, SetMode
+from mavros_msgs.msg import State, StatusText
+from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
 
+
+HOVER_TIME       = 5.0   # seconds to hover between takeoff and land
+_CMD_INTERVAL    = 2.0   # seconds between command retries
+_ARM_TIMEOUT     = 30.0  # seconds to wait for arm confirmation
+_TAKEOFF_TIMEOUT = 30.0  # seconds to wait for AUTO.TAKEOFF mode confirmation
+_LAND_TIMEOUT    = 30.0  # seconds to wait for AUTO.LAND mode confirmation
 
 RC_OVERRIDE_MODES = {'ALTCTL', 'POSCTL'}
-
-_RETRIES = 5
-_RETRY_DELAY = 1.0  # seconds
 
 
 class TakeoffAndLand(Node):
@@ -39,73 +43,131 @@ class TakeoffAndLand(Node):
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
+        state_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
 
         self.state = State()
-        self.create_subscription(State, '/mavros/state', lambda msg: setattr(self, 'state', msg), qos)
+        self.gps_latitude  = 0.0
+        self.gps_longitude = 0.0
+        self.create_subscription(State, '/mavros/state', self._on_state, state_qos)
+        self.create_subscription(StatusText, '/mavros/statustext', self._on_statustext, qos)
         self.arm_client  = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.mode_client = self.create_client(SetMode,     '/mavros/set_mode')
+        self.land_client = self.create_client(CommandTOL,  '/mavros/cmd/land')
 
-    def _spin_for(self, seconds):
-        deadline = self.get_clock().now().nanoseconds + int(seconds * 1e9)
-        while self.get_clock().now().nanoseconds < deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
+    def _on_state(self, msg: State):
+        self.state = msg
 
-    def _set_mode(self, mode):
-        self.mode_client.wait_for_service()
-        req = SetMode.Request()
-        req.custom_mode = mode
-        for attempt in range(1, _RETRIES + 1):
-            future = self.mode_client.call_async(req)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
-            if not (future.result() and future.result().mode_sent):
-                self.get_logger().warn(
-                    f'SET_MODE {mode}: attempt {attempt}/{_RETRIES} rejected'
-                    + (' — retrying' if attempt < _RETRIES else '')
-                )
-            else:
-                # mode_sent is an ACK only — verify the mode actually flipped
-                self._spin_for(_RETRY_DELAY)
-                if self.state.mode == mode:
-                    self.get_logger().info(f'SET_MODE {mode}: confirmed (attempt {attempt})')
-                    return True
-                self.get_logger().warn(
-                    f'SET_MODE {mode}: ACKed but mode did not flip (attempt {attempt}/{_RETRIES})'
-                    + (' — retrying' if attempt < _RETRIES else '')
-                )
-                continue  # delay already consumed above
-            self._spin_for(_RETRY_DELAY)
-        return False
-
-    def _arm(self):
-        self.arm_client.wait_for_service()
-        req = CommandBool.Request()
-        req.value = True
-        for attempt in range(1, _RETRIES + 1):
-            future = self.arm_client.call_async(req)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
-            if not (future.result() and future.result().success):
-                self.get_logger().warn(
-                    f'ARM: attempt {attempt}/{_RETRIES} rejected'
-                    + (' — retrying' if attempt < _RETRIES else '')
-                )
-            else:
-                self._spin_for(_RETRY_DELAY)
-                if self.state.armed:
-                    self.get_logger().info(f'ARM: confirmed (attempt {attempt})')
-                    return True
-                self.get_logger().warn(
-                    f'ARM: ACKed but not armed yet (attempt {attempt}/{_RETRIES})'
-                    + (' — retrying' if attempt < _RETRIES else '')
-                )
-                continue
-            self._spin_for(_RETRY_DELAY)
-        return False
+    def _on_statustext(self, msg: StatusText):
+        self.get_logger().info(f'[PX4] {msg.text}')
 
     def _rc_override(self):
-        """Returns True if the RC has switched to an override mode."""
         return self.state.mode in RC_OVERRIDE_MODES
 
+    def _arm(self):
+        self.get_logger().info('Arming — will retry until confirmed...')
+        self.arm_client.wait_for_service()
+        deadline = time.monotonic() + _ARM_TIMEOUT
+        last_send = 0.0
+        while time.monotonic() < deadline:
+            if time.monotonic() - last_send >= _CMD_INTERVAL:
+                req = CommandBool.Request()
+                req.value = True
+                future = self.arm_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future, timeout_sec=1.0)
+                result = future.result() if future.done() else None
+                if result and result.success:
+                    self.get_logger().info('ARM: ACK success')
+                else:
+                    self.get_logger().warn('ARM: no ACK — retrying...')
+                last_send = time.monotonic()
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if self.state.armed:
+                self.get_logger().info('Armed.')
+                return True
+        return False
+
+    def _takeoff(self):
+        self.get_logger().info('Commanding AUTO.TAKEOFF — will retry until mode confirms...')
+        self.mode_client.wait_for_service()
+        deadline = time.monotonic() + _TAKEOFF_TIMEOUT
+        last_send = 0.0
+        while time.monotonic() < deadline:
+            if time.monotonic() - last_send >= _CMD_INTERVAL:
+                req = SetMode.Request()
+                req.custom_mode = 'AUTO.TAKEOFF'
+                future = self.mode_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future, timeout_sec=1.0)
+                result = future.result() if future.done() else None
+                if result and result.mode_sent:
+                    self.get_logger().info('SET_MODE AUTO.TAKEOFF: ACK success')
+                else:
+                    self.get_logger().warn('SET_MODE AUTO.TAKEOFF: no ACK — retrying...')
+                last_send = time.monotonic()
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if self._rc_override():
+                self.get_logger().info(f'RC override ({self.state.mode}) — handing off.')
+                return None
+            if self.state.mode == 'AUTO.TAKEOFF':
+                self.get_logger().info('AUTO.TAKEOFF mode confirmed.')
+                return True
+            if not self.state.armed:
+                self.get_logger().error('Drone disarmed before takeoff confirmed — aborting.')
+                return False
+        return False
+
+    def _land(self):
+        self.get_logger().info('Commanding AUTO.LAND — will retry until mode confirms...')
+        self.land_client.wait_for_service()
+        deadline = time.monotonic() + _LAND_TIMEOUT
+        last_send = 0.0
+        while time.monotonic() < deadline:
+            if time.monotonic() - last_send >= _CMD_INTERVAL:
+                req = CommandTOL.Request()
+                req.min_pitch = 0.0
+                req.yaw = float('nan')
+                req.latitude = self.gps_latitude
+                req.longitude = self.gps_longitude
+                req.altitude = 0.0
+                future = self.land_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future, timeout_sec=1.0)
+                result = future.result() if future.done() else None
+                if result and result.success:
+                    self.get_logger().info('cmd/land: ACK success')
+                else:
+                    self.get_logger().warn('cmd/land: no ACK — retrying...')
+                last_send = time.monotonic()
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if self._rc_override():
+                self.get_logger().info(f'RC override ({self.state.mode}) — handing off.')
+                return None
+            if self.state.mode == 'AUTO.LAND':
+                self.get_logger().info('AUTO.LAND mode confirmed.')
+                return True
+            if not self.state.armed:
+                self.get_logger().info('Drone disarmed — already landed.')
+                return True
+        return False
+
     def run(self):
+        # Spin briefly to see if MAVROS is already connected.
+        deadline = time.monotonic() + 2.0
+        while not self.state.connected and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        if not self.state.connected:
+            self.get_logger().info('MAVROS not connected — launching...')
+            subprocess.Popen(
+                ['ros2', 'launch', 'mavros', 'px4.launch', 'fcu_url:=/dev/ttyTHS1:115200'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            self.get_logger().info('MAVROS already connected — reusing.')
+
         self.get_logger().info('Waiting for MAVROS connection...')
         while not self.state.connected:
             rclpy.spin_once(self, timeout_sec=0.1)
@@ -124,33 +186,46 @@ class TakeoffAndLand(Node):
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
-        self.get_logger().info('Key received — arming and switching to AUTO.TAKEOFF...')
+        self.get_logger().info('Key received — arming and taking off...')
+
         if not self._arm():
-            self.get_logger().error('Failed to arm after all retries — aborting.')
-            return
-        if not self._set_mode('AUTO.TAKEOFF'):
-            self.get_logger().error('Failed to set AUTO.TAKEOFF after all retries — aborting.')
+            self.get_logger().error('Failed to arm — aborting.')
             return
 
-        # Wait for takeoff to complete, bail out on RC override
+        result = self._takeoff()
+        if result is None:
+            return  # RC override
+        if not result:
+            self.get_logger().error('Failed to set AUTO.TAKEOFF — aborting.')
+            return
+
         self.get_logger().info('Climbing to takeoff altitude...')
         while self.state.mode == 'AUTO.TAKEOFF':
             if self._rc_override():
                 self.get_logger().info(f'RC override ({self.state.mode}) during climb — handing off.')
                 return
+            if not self.state.armed:
+                self.get_logger().error('Drone disarmed during climb — aborting.')
+                return
             rclpy.spin_once(self, timeout_sec=0.1)
 
-        # AUTO.TAKEOFF transitions to hover momentarily — go straight to landing
-        self.get_logger().info('Takeoff complete. Switching to AUTO.LAND...')
-        if not self._set_mode('AUTO.LAND'):
-            self.get_logger().error('Failed to set AUTO.LAND after all retries — drone left hovering.')
+        self.get_logger().info(f'Takeoff complete. Hovering for {HOVER_TIME:.0f}s...')
+        hover_deadline = time.monotonic() + HOVER_TIME
+        while time.monotonic() < hover_deadline:
+            if self._rc_override():
+                self.get_logger().info(f'RC override ({self.state.mode}) during hover — handing off.')
+                return
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        result = self._land()
+        if result is None:
+            return  # RC override
+        if not result:
+            self.get_logger().error('Failed to land — drone left hovering. Disarm manually via RC.')
             return
 
-        # Wait until disarmed, still watching for RC override
+        self.get_logger().info('AUTO.LAND confirmed. Waiting until disarmed...')
         while self.state.armed:
-            if self._rc_override():
-                self.get_logger().info(f'RC override ({self.state.mode}) during landing — handing off.')
-                return
             rclpy.spin_once(self, timeout_sec=0.1)
 
         self.get_logger().info('Landed and disarmed.')
@@ -160,15 +235,8 @@ def main():
     print("=" * 40)
     print("Takeoff and land")
     print()
-    print("Starting MAVROS...")
-    subprocess.Popen(
-        ['ros2', 'launch', 'mavros', 'px4.launch', 'fcu_url:=/dev/ttyTHS1:921600'],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    print("Press any key to arm and trigger AUTO.TAKEOFF.")
+    print(f"Hover time: {HOVER_TIME:.0f}s")
     print("Takeoff altitude is set via MIS_TAKEOFF_ALT in QGroundControl.")
-    print("The drone will AUTO.LAND as soon as it reaches altitude.")
     print("Switch to ALTCTL or POSCTL at any time for immediate RC override.")
     print("=" * 40)
     print()
