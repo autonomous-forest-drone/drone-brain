@@ -164,6 +164,9 @@ class LandOnKey(Node):
             if self.state.mode == 'AUTO.LAND':
                 self.get_logger().info('AUTO.LAND mode confirmed.')
                 return True
+            if not self.state.armed:
+                self.get_logger().info('Drone disarmed — already landed.')
+                return True
         return False
 
     def run(self):
