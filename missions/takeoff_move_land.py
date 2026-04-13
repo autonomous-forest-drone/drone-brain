@@ -4,6 +4,12 @@ Key press → arm → AUTO.TAKEOFF → OFFBOARD (move forward 1 m/s for 1 s) →
 Velocity setpoints use body frame (base_link): x = forward, y = left, z = up.
 PX4 closes the velocity loop via GPS/EKF2, so GPS lock is required.
 
+RC override: switching to ALTCTL or POSCTL at any point hands control back
+to the RC immediately and the script exits.
+
+After landing the script switches to POSCTL so the next run starts from a
+clean mode (PX4 would otherwise revert to OFFBOARD after disarm).
+
 Requires MAVROS running:
   ros2 launch mavros px4.launch fcu_url:=/dev/ttyTHS1:115200
 Run:
@@ -28,6 +34,8 @@ FORWARD_SPEED   = 1.0   # m/s — body x (forward)
 MOVE_TIME       = 2.0   # seconds → ~1 m
 PRESTREAM_TIME  = 2.0   # seconds to stream zeros before switching to OFFBOARD
 SETPOINT_HZ     = 20    # Hz — must stay >2 Hz or PX4 exits OFFBOARD
+
+RC_OVERRIDE_MODES = {'ALTCTL', 'POSCTL'}
 
 _CMD_INTERVAL    = 2.0
 _ARM_TIMEOUT     = 30.0
@@ -70,6 +78,9 @@ class TakeoffMoveLand(Node):
 
     def _on_statustext(self, msg: StatusText):
         self.get_logger().info(f'[PX4] {msg.text}')
+
+    def _rc_override(self):
+        return self.state.mode in RC_OVERRIDE_MODES
 
     def _publish_vel(self, vx: float = 0.0, vy: float = 0.0, vz: float = 0.0):
         """Publish velocity in body frame: x=forward, y=left, z=up."""
@@ -124,6 +135,9 @@ class TakeoffMoveLand(Node):
                     self.get_logger().warn('SET_MODE AUTO.TAKEOFF: no ACK — retrying...')
                 last_send = time.monotonic()
             rclpy.spin_once(self, timeout_sec=0.1)
+            if self._rc_override():
+                self.get_logger().info(f'RC override ({self.state.mode}) during takeoff command — handing off.')
+                return None
             if self.state.mode == 'AUTO.TAKEOFF':
                 self.get_logger().info('AUTO.TAKEOFF mode confirmed.')
                 return True
@@ -160,6 +174,9 @@ class TakeoffMoveLand(Node):
                     self.get_logger().warn('SET_MODE OFFBOARD: no ACK — retrying...')
                 last_send = time.monotonic()
             rclpy.spin_once(self, timeout_sec=dt)
+            if self._rc_override():
+                self.get_logger().info(f'RC override ({self.state.mode}) during OFFBOARD switch — handing off.')
+                return None
             if self.state.mode == 'OFFBOARD':
                 self.get_logger().info('OFFBOARD confirmed.')
                 return True
@@ -190,6 +207,9 @@ class TakeoffMoveLand(Node):
                     self.get_logger().warn('cmd/land: no ACK — retrying...')
                 last_send = time.monotonic()
             rclpy.spin_once(self, timeout_sec=0.1)
+            if self._rc_override():
+                self.get_logger().info(f'RC override ({self.state.mode}) during land — handing off.')
+                return None
             if self.state.mode == 'AUTO.LAND':
                 self.get_logger().info('AUTO.LAND mode confirmed.')
                 return True
@@ -197,6 +217,20 @@ class TakeoffMoveLand(Node):
                 self.get_logger().info('Drone disarmed — already landed.')
                 return True
         return False
+
+    def _set_posctl(self):
+        """Switch to POSCTL so the next run starts from a clean mode."""
+        self.get_logger().info('Switching to POSCTL...')
+        self.mode_client.wait_for_service()
+        req = SetMode.Request()
+        req.custom_mode = 'POSCTL'
+        future = self.mode_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+        result = future.result() if future.done() else None
+        if result and result.mode_sent:
+            self.get_logger().info('POSCTL: mode sent.')
+        else:
+            self.get_logger().warn('POSCTL: no ACK — leaving mode as-is.')
 
     # ------------------------------------------------------------------ mission
 
@@ -245,12 +279,18 @@ class TakeoffMoveLand(Node):
             return
 
         # ---- AUTO.TAKEOFF ----
-        if not self._takeoff():
+        result = self._takeoff()
+        if result is None:
+            return  # RC override
+        if not result:
             self.get_logger().error('Failed to set AUTO.TAKEOFF — aborting.')
             return
 
         self.get_logger().info('Climbing to takeoff altitude...')
         while self.state.mode == 'AUTO.TAKEOFF':
+            if self._rc_override():
+                self.get_logger().info(f'RC override ({self.state.mode}) during climb — handing off.')
+                return
             if not self.state.armed:
                 self.get_logger().error('Drone disarmed during climb — aborting.')
                 return
@@ -259,7 +299,10 @@ class TakeoffMoveLand(Node):
         self.get_logger().info(f'Takeoff complete (now in {self.state.mode}).')
 
         # ---- switch to OFFBOARD ----
-        if not self._switch_offboard():
+        result = self._switch_offboard()
+        if result is None:
+            return  # RC override
+        if not result:
             self.get_logger().error('Failed to enter OFFBOARD — aborting.')
             return
 
@@ -271,6 +314,9 @@ class TakeoffMoveLand(Node):
         while time.monotonic() < deadline:
             self._publish_vel(vx=FORWARD_SPEED)
             rclpy.spin_once(self, timeout_sec=dt)
+            if self._rc_override():
+                self.get_logger().info(f'RC override ({self.state.mode}) during forward move — handing off.')
+                return
             if not self.state.armed:
                 self.get_logger().error('Drone disarmed during forward move — aborting.')
                 return
@@ -281,9 +327,15 @@ class TakeoffMoveLand(Node):
         while time.monotonic() < stop_deadline:
             self._publish_vel()
             rclpy.spin_once(self, timeout_sec=dt)
+            if self._rc_override():
+                self.get_logger().info(f'RC override ({self.state.mode}) during stop — handing off.')
+                return
 
         # ---- land ----
-        if not self._land():
+        result = self._land()
+        if result is None:
+            return  # RC override
+        if not result:
             self.get_logger().error('Failed to land — drone left hovering. Disarm manually via RC.')
             return
 
@@ -292,16 +344,18 @@ class TakeoffMoveLand(Node):
             rclpy.spin_once(self, timeout_sec=0.1)
 
         self.get_logger().info('Landed and disarmed.')
+        self._set_posctl()
 
 
 def main():
     print("=" * 50)
     print("Takeoff → move forward 1 m → land")
     print()
-    print(f"Forward speed : {FORWARD_SPEED} m/s")
-    print(f"Move duration : {MOVE_TIME} s  (~{FORWARD_SPEED * MOVE_TIME:.1f} m)")
+    print(f"Forward speed    : {FORWARD_SPEED} m/s")
+    print(f"Move duration    : {MOVE_TIME} s  (~{FORWARD_SPEED * MOVE_TIME:.1f} m)")
     print("Takeoff altitude : set via MIS_TAKEOFF_ALT in QGC")
-    print("Requires        : GPS lock")
+    print("Requires         : GPS lock")
+    print("RC override      : switch to ALTCTL or POSCTL at any time")
     print("=" * 50)
     print()
 
