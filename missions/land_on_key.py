@@ -2,7 +2,7 @@
 Waits for any key press, then commands AUTO.LAND immediately.
 
 Requires MAVROS running:
-  ros2 launch mavros px4.launch fcu_url:=/dev/ttyTHS1:921600
+  ros2 launch mavros px4.launch fcu_url:=/dev/ttyTHS1:115200
 Run:
   python3 land_on_key.py
 """
