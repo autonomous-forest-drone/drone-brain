@@ -12,9 +12,9 @@ At each control loop tick the script:
   4. Otherwise applies a proportional yaw rate to keep the nose pointed at the
      goal and drives forward at CRUISE_SPEED.  No strafe (vy=0).
 
-This means the drone always faces the goal.  The trade-off vs gps_goto.py is
-that the flight path is not perfectly straight — it curves while the heading
-converges — but it looks more natural and requires no separate alignment phase.
+The drone first rotates in place to face the goal (_align_yaw), then drives
+forward while continuously correcting its heading with a proportional yaw rate.
+The flight path is straight once aligned, with ongoing correction for any drift.
 
 Body frame convention (base_link): x=forward, y=left, z=up.
 Yaw in ENU: 0=East, CCW positive.
