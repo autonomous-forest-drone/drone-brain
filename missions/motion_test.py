@@ -47,7 +47,9 @@ MOVE_TIME      = 2.0   # seconds per segment
 PAUSE_TIME     = 0.5   # seconds of zero-velocity hold between segments
 PRESTREAM_TIME = 2.0   # seconds to stream zeros before switching to OFFBOARD
 SETPOINT_HZ    = 20    # Hz — must stay >2 Hz or PX4 exits OFFBOARD
-ALT_KP         = 0.5   # proportional gain for altitude hold (m/s per metre of error)
+ALT_KP         = 1.0   # proportional gain for altitude hold (m/s per metre of error)
+ALT_KI         = 0.3   # integral gain — eliminates steady-state drift
+ALT_I_MAX      = 0.5   # anti-windup: clamp on integral contribution (m/s)
 
 # (label, duration, vx, vy, vz, yaw_rate)
 # body frame: x=forward, y=left, z=up, yaw_rate positive=CCW
@@ -91,6 +93,7 @@ class MotionTest(Node):
         self.gps_longitude = 0.0
         self.pose          = None   # PoseStamped — None until first message
         self.target_z      = None   # altitude (m, ENU) to hold during OFFBOARD
+        self._alt_integral = 0.0    # PI controller integral accumulator
         # Latch: becomes True once we've seen a non-RC mode during the mission.
         # Only after that can a return to POSCTL/ALTCTL be a genuine pilot takeover.
         self._left_rc_modes = False
@@ -122,12 +125,18 @@ class MotionTest(Node):
         return self._left_rc_modes
 
     def _vz_hold(self) -> float:
-        """Proportional vz correction to maintain target_z.  Returns 0 until
-        both pose and target_z are set.  Clamped to ±1 m/s."""
+        """PI vz correction to maintain target_z.
+        P term responds immediately to error; I term accumulates to eliminate
+        steady-state drift (the main cause of the drone slowly sinking).
+        Returns 0 until both pose and target_z are set.  Clamped to ±1 m/s."""
         if self.target_z is None or self.pose is None:
             return 0.0
+        dt  = 1.0 / SETPOINT_HZ
         err = self.target_z - self.pose.pose.position.z
-        return max(-1.0, min(1.0, ALT_KP * err))
+        self._alt_integral += err * dt
+        self._alt_integral  = max(-ALT_I_MAX, min(ALT_I_MAX, self._alt_integral))
+        vz = ALT_KP * err + ALT_KI * self._alt_integral
+        return max(-1.0, min(1.0, vz))
 
     def _publish_vel(self, vx: float = 0.0, vy: float = 0.0, vz: float = 0.0,
                      yaw_rate: float = 0.0):
@@ -374,7 +383,8 @@ class MotionTest(Node):
 
         # Record the altitude to hold throughout the motion sequence.
         if self.pose is not None:
-            self.target_z = self.pose.pose.position.z
+            self.target_z      = self.pose.pose.position.z
+            self._alt_integral = 0.0
             self.get_logger().info(f'Altitude hold target: {self.target_z:.2f} m (ENU)')
         else:
             self.get_logger().warn('No pose yet — altitude hold disabled.')
