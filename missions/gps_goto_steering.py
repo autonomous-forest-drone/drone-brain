@@ -50,8 +50,8 @@ from sensor_msgs.msg import NavSatFix
 # ------------------------------------------------------------------ goal & tuning
 
 # !! Set your target GPS coordinates here !!
-GOAL_LAT = 56.0486156   # degrees — target latitude
-GOAL_LON = 14.1489345   # degrees — target longitude
+GOAL_LAT = 56.0484350   # degrees — target latitude
+GOAL_LON = 14.1484201   # degrees — target longitude
 
 CRUISE_SPEED  = 1.0    # m/s   — forward speed (vx only, no strafe)
 GOAL_RADIUS   = 0.5    # m     — arrival threshold (horizontal distance)
