@@ -302,7 +302,8 @@ class GpsGoto(Node):
         target_yaw = math.atan2(dn, de)
 
         self.get_logger().info(
-            f'Aligning yaw to goal bearing {math.degrees(target_yaw):.1f}° (ENU)...'
+            f'Aligning yaw to goal bearing {math.degrees(target_yaw):.1f}° (ENU)  '
+            f'from gps=({self.gps.latitude:.7f},{self.gps.longitude:.7f})'
         )
 
         while time.monotonic() < deadline:
@@ -321,6 +322,7 @@ class GpsGoto(Node):
             yaw_rate = max(-YAW_RATE_MAX, min(YAW_RATE_MAX, error))
             self._publish_vel(yaw_rate=yaw_rate, vz=self._vz_hold())
             self.get_logger().info(
+                f'gps=({self.gps.latitude:.7f},{self.gps.longitude:.7f})  '
                 f'yaw_err={math.degrees(error):.1f}°  rate={yaw_rate:.2f} rad/s',
                 throttle_duration_sec=0.5,
             )
@@ -360,6 +362,7 @@ class GpsGoto(Node):
 
             vx, vy = self._vel_toward_goal(dn, de, dist)
             self.get_logger().info(
+                f'gps=({self.gps.latitude:.7f},{self.gps.longitude:.7f})  '
                 f'dist={dist:.1f}m  vx={vx:.2f}  vy={vy:.2f}',
                 throttle_duration_sec=1.0,
             )
