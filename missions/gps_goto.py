@@ -46,8 +46,8 @@ from sensor_msgs.msg import NavSatFix
 # ------------------------------------------------------------------ goal & tuning
 
 # !! Set your target GPS coordinates here !!
-GOAL_LAT = 0.0   # degrees — target latitude
-GOAL_LON = 0.0   # degrees — target longitude
+GOAL_LAT = 56.0486156   # degrees — target latitude
+GOAL_LON = 14.1489345   # degrees — target longitude
 
 CRUISE_SPEED   = 1.0    # m/s — horizontal speed toward goal
 GOAL_RADIUS    = 0.5    # m   — arrival threshold (horizontal distance)
@@ -57,6 +57,10 @@ GOTO_TIMEOUT   = 120.0  # s   — abort if goal not reached within this time
 YAW_RATE_MAX      = 0.5    # rad/s — max yaw rate during alignment (~28°/s)
 YAW_ALIGN_THRESH  = 0.087  # rad   — alignment done when error < ~5°
 YAW_ALIGN_TIMEOUT = 30.0   # s     — abort if alignment not achieved in time
+
+ALT_KP    = 1.0   # proportional gain for altitude hold (m/s per metre of error)
+ALT_KI    = 0.3   # integral gain — eliminates steady-state drift
+ALT_I_MAX = 0.5   # anti-windup: clamp on integral contribution (m/s)
 
 PRESTREAM_TIME  = 2.0   # s   — stream zeros before switching to OFFBOARD
 SETPOINT_HZ     = 20    # Hz  — must stay >2 Hz or PX4 exits OFFBOARD
@@ -92,7 +96,9 @@ class GpsGoto(Node):
         self.state = State()
         self.gps   = NavSatFix()
         self.gps.status.status = -1   # NavSatStatus.STATUS_NO_FIX
-        self.pose  = None             # PoseStamped — None until first message
+        self.pose          = None   # PoseStamped — None until first message
+        self.target_z      = None   # altitude (m, ENU) to hold during OFFBOARD
+        self._alt_integral = 0.0    # PI controller integral accumulator
 
         # Latch: True once we've seen a non-RC mode (prevents POSCTL start from
         # tripping the override check before AUTO.TAKEOFF is confirmed).
@@ -165,6 +171,19 @@ class GpsGoto(Node):
         vx = (ue * math.cos(yaw) + un * math.sin(yaw)) * CRUISE_SPEED
         vy = (-ue * math.sin(yaw) + un * math.cos(yaw)) * CRUISE_SPEED
         return vx, vy
+
+    def _vz_hold(self) -> float:
+        """PI vz correction to maintain target_z.
+        P term responds immediately; I term eliminates steady-state drift.
+        Returns 0 until both pose and target_z are set.  Clamped to ±1 m/s."""
+        if self.target_z is None or self.pose is None:
+            return 0.0
+        dt  = 1.0 / SETPOINT_HZ
+        err = self.target_z - self.pose.pose.position.z
+        self._alt_integral += err * dt
+        self._alt_integral  = max(-ALT_I_MAX, min(ALT_I_MAX, self._alt_integral))
+        vz = ALT_KP * err + ALT_KI * self._alt_integral
+        return max(-1.0, min(1.0, vz))
 
     def _publish_vel(self, vx: float = 0.0, vy: float = 0.0, vz: float = 0.0,
                      yaw_rate: float = 0.0):
@@ -300,7 +319,7 @@ class GpsGoto(Node):
 
             # Proportional control, clamped to YAW_RATE_MAX
             yaw_rate = max(-YAW_RATE_MAX, min(YAW_RATE_MAX, error))
-            self._publish_vel(yaw_rate=yaw_rate)
+            self._publish_vel(yaw_rate=yaw_rate, vz=self._vz_hold())
             self.get_logger().info(
                 f'yaw_err={math.degrees(error):.1f}°  rate={yaw_rate:.2f} rad/s',
                 throttle_duration_sec=0.5,
@@ -344,7 +363,7 @@ class GpsGoto(Node):
                 f'dist={dist:.1f}m  vx={vx:.2f}  vy={vy:.2f}',
                 throttle_duration_sec=1.0,
             )
-            self._publish_vel(vx=vx, vy=vy)
+            self._publish_vel(vx=vx, vy=vy, vz=self._vz_hold())
             rclpy.spin_once(self, timeout_sec=dt)
 
             if self._rc_override():
@@ -502,6 +521,14 @@ class GpsGoto(Node):
             self.get_logger().error('Failed to enter OFFBOARD — aborting.')
             return
 
+        # Record altitude target for hold controller.
+        if self.pose is not None:
+            self.target_z      = self.pose.pose.position.z
+            self._alt_integral = 0.0
+            self.get_logger().info(f'Altitude hold target: {self.target_z:.2f} m (ENU)')
+        else:
+            self.get_logger().warn('No pose yet — altitude hold disabled.')
+
         # ---- face the goal ----
         result = self._align_yaw()
         if result is None:
@@ -520,7 +547,7 @@ class GpsGoto(Node):
         dt = 1.0 / SETPOINT_HZ
         hover_deadline = time.monotonic() + HOVER_TIME
         while time.monotonic() < hover_deadline:
-            self._publish_vel()
+            self._publish_vel(vz=self._vz_hold())
             rclpy.spin_once(self, timeout_sec=dt)
             if self._rc_override():
                 self.get_logger().info(f'RC override ({self.state.mode}) during hover — handing off.')
