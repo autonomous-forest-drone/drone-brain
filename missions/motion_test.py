@@ -36,7 +36,7 @@ import tty
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
-from geometry_msgs.msg import TwistStamped
+from geometry_msgs.msg import TwistStamped, PoseStamped
 from mavros_msgs.msg import State, StatusText
 from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
 
@@ -47,6 +47,7 @@ MOVE_TIME      = 2.0   # seconds per segment
 PAUSE_TIME     = 0.5   # seconds of zero-velocity hold between segments
 PRESTREAM_TIME = 2.0   # seconds to stream zeros before switching to OFFBOARD
 SETPOINT_HZ    = 20    # Hz — must stay >2 Hz or PX4 exits OFFBOARD
+ALT_KP         = 0.5   # proportional gain for altitude hold (m/s per metre of error)
 
 # (label, duration, vx, vy, vz, yaw_rate)
 # body frame: x=forward, y=left, z=up, yaw_rate positive=CCW
@@ -88,11 +89,14 @@ class MotionTest(Node):
         self.state        = State()
         self.gps_latitude  = 0.0
         self.gps_longitude = 0.0
+        self.pose          = None   # PoseStamped — None until first message
+        self.target_z      = None   # altitude (m, ENU) to hold during OFFBOARD
         # Latch: becomes True once we've seen a non-RC mode during the mission.
         # Only after that can a return to POSCTL/ALTCTL be a genuine pilot takeover.
         self._left_rc_modes = False
-        self.create_subscription(State,      '/mavros/state',      self._on_state,      state_qos)
-        self.create_subscription(StatusText, '/mavros/statustext', self._on_statustext, qos)
+        self.create_subscription(State,       '/mavros/state',               self._on_state,      state_qos)
+        self.create_subscription(StatusText,  '/mavros/statustext',          self._on_statustext, qos)
+        self.create_subscription(PoseStamped, '/mavros/local_position/pose', self._on_pose,       qos)
 
         self.arm_client  = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.mode_client = self.create_client(SetMode,     '/mavros/set_mode')
@@ -108,11 +112,22 @@ class MotionTest(Node):
     def _on_statustext(self, msg: StatusText):
         self.get_logger().info(f'[PX4] {msg.text}')
 
+    def _on_pose(self, msg: PoseStamped):
+        self.pose = msg
+
     def _rc_override(self):
         if self.state.mode not in RC_OVERRIDE_MODES:
             self._left_rc_modes = True
             return False
         return self._left_rc_modes
+
+    def _vz_hold(self) -> float:
+        """Proportional vz correction to maintain target_z.  Returns 0 until
+        both pose and target_z are set.  Clamped to ±1 m/s."""
+        if self.target_z is None or self.pose is None:
+            return 0.0
+        err = self.target_z - self.pose.pose.position.z
+        return max(-1.0, min(1.0, ALT_KP * err))
 
     def _publish_vel(self, vx: float = 0.0, vy: float = 0.0, vz: float = 0.0,
                      yaw_rate: float = 0.0):
@@ -228,7 +243,7 @@ class MotionTest(Node):
         dt       = 1.0 / SETPOINT_HZ
         deadline = time.monotonic() + duration
         while time.monotonic() < deadline:
-            self._publish_vel(vx=vx, vy=vy, vz=vz, yaw_rate=yaw_rate)
+            self._publish_vel(vx=vx, vy=vy, vz=vz + self._vz_hold(), yaw_rate=yaw_rate)
             rclpy.spin_once(self, timeout_sec=dt)
             if self._rc_override():
                 self.get_logger().info(f'RC override ({self.state.mode}) during {label} — handing off.')
@@ -357,6 +372,13 @@ class MotionTest(Node):
             self.get_logger().error('Failed to enter OFFBOARD — aborting.')
             return
 
+        # Record the altitude to hold throughout the motion sequence.
+        if self.pose is not None:
+            self.target_z = self.pose.pose.position.z
+            self.get_logger().info(f'Altitude hold target: {self.target_z:.2f} m (ENU)')
+        else:
+            self.get_logger().warn('No pose yet — altitude hold disabled.')
+
         # ---- motion sequence ----
         dt = 1.0 / SETPOINT_HZ
         for label, duration, vx, vy, vz, yaw_rate in PHASES:
@@ -369,7 +391,7 @@ class MotionTest(Node):
             # brief stop between segments
             stop_deadline = time.monotonic() + PAUSE_TIME
             while time.monotonic() < stop_deadline:
-                self._publish_vel()
+                self._publish_vel(vz=self._vz_hold())
                 rclpy.spin_once(self, timeout_sec=dt)
                 if self._rc_override():
                     self.get_logger().info(f'RC override ({self.state.mode}) during pause — handing off.')
