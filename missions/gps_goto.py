@@ -106,7 +106,7 @@ class GpsGoto(Node):
 
         self.create_subscription(State,       '/mavros/state',                  self._on_state,      state_qos)
         self.create_subscription(StatusText,  '/mavros/statustext',             self._on_statustext, qos)
-        self.create_subscription(NavSatFix,   '/mavros/global_position/raw/fix', self._on_gps,       qos)
+        self.create_subscription(NavSatFix,   '/mavros/global_position/global',  self._on_gps,       qos)
         self.create_subscription(PoseStamped, '/mavros/local_position/pose',    self._on_pose,       qos)
 
         self.arm_client  = self.create_client(CommandBool, '/mavros/cmd/arming')
@@ -296,17 +296,14 @@ class GpsGoto(Node):
         dt       = 1.0 / SETPOINT_HZ
         deadline = time.monotonic() + YAW_ALIGN_TIMEOUT
 
-        dn, de, _ = self._displacement_to_goal()
-        # Target ENU yaw: angle from East axis toward goal direction.
-        # ENU: 0=East, CCW positive.  atan2(North, East) gives the bearing.
-        target_yaw = math.atan2(dn, de)
-
-        self.get_logger().info(
-            f'Aligning yaw to goal bearing {math.degrees(target_yaw):.1f}° (ENU)  '
-            f'from gps=({self.gps.latitude:.7f},{self.gps.longitude:.7f})'
-        )
+        self.get_logger().info('Aligning yaw to goal...')
 
         while time.monotonic() < deadline:
+            # Recompute bearing from fresh GPS every tick so GPS drift is
+            # tracked rather than locked in from a single bad snapshot.
+            dn, de, _ = self._displacement_to_goal()
+            target_yaw = math.atan2(dn, de)
+
             current_yaw = self._yaw_from_pose()
             error = target_yaw - current_yaw
             # Normalise to (-π, π]
@@ -323,6 +320,7 @@ class GpsGoto(Node):
             self._publish_vel(yaw_rate=yaw_rate, vz=self._vz_hold())
             self.get_logger().info(
                 f'gps=({self.gps.latitude:.7f},{self.gps.longitude:.7f})  '
+                f'bearing={math.degrees(target_yaw):.1f}°  '
                 f'yaw_err={math.degrees(error):.1f}°  rate={yaw_rate:.2f} rad/s',
                 throttle_duration_sec=0.5,
             )

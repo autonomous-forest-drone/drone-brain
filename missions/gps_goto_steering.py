@@ -110,7 +110,7 @@ class GpsGotoSteering(Node):
 
         self.create_subscription(State,       '/mavros/state',                   self._on_state,      state_qos)
         self.create_subscription(StatusText,  '/mavros/statustext',              self._on_statustext, qos)
-        self.create_subscription(NavSatFix,   '/mavros/global_position/raw/fix', self._on_gps,        qos)
+        self.create_subscription(NavSatFix,   '/mavros/global_position/global',  self._on_gps,        qos)
         self.create_subscription(PoseStamped, '/mavros/local_position/pose',     self._on_pose,       qos)
 
         self.arm_client  = self.create_client(CommandBool, '/mavros/cmd/arming')
