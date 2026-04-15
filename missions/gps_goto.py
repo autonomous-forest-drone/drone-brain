@@ -159,18 +159,12 @@ class GpsGoto(Node):
         return dn, de, dist
 
     def _vel_toward_goal(self, dn: float, de: float, dist: float):
-        """Body-frame (vx, vy) at CRUISE_SPEED pointing toward goal.
-        ENU → body rotation uses current yaw from local_position/pose."""
-        yaw = self._yaw_from_pose()
-        # unit ENU vector toward goal (East, North)
-        ue = de / dist
-        un = dn / dist
-        # rotate into body frame:  x=forward, y=left
-        # forward = East*cos(yaw) + North*sin(yaw)
-        # left    = -East*sin(yaw) + North*cos(yaw)
-        vx = (ue * math.cos(yaw) + un * math.sin(yaw)) * CRUISE_SPEED
-        vy = (-ue * math.sin(yaw) + un * math.cos(yaw)) * CRUISE_SPEED
-        return vx, vy
+        """ENU world-frame (ve, vn) at CRUISE_SPEED pointing toward goal.
+        MAVROS cmd_vel treats linear.x/y as East/North regardless of frame_id,
+        so we send ENU directly and skip the body-frame rotation entirely."""
+        ve = (de / dist) * CRUISE_SPEED  # east
+        vn = (dn / dist) * CRUISE_SPEED  # north
+        return ve, vn
 
     def _vz_hold(self) -> float:
         """PI vz correction to maintain target_z.
@@ -187,10 +181,10 @@ class GpsGoto(Node):
 
     def _publish_vel(self, vx: float = 0.0, vy: float = 0.0, vz: float = 0.0,
                      yaw_rate: float = 0.0):
-        """Publish velocity in body frame: x=forward, y=left, z=up, yaw_rate=CCW."""
+        """Publish velocity in ENU world frame: x=east, y=north, z=up, yaw_rate=CCW."""
         msg = TwistStamped()
         msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_link'
+        msg.header.frame_id = 'map'
         msg.twist.linear.x  = vx
         msg.twist.linear.y  = vy
         msg.twist.linear.z  = vz
@@ -358,13 +352,13 @@ class GpsGoto(Node):
                 )
                 return True
 
-            vx, vy = self._vel_toward_goal(dn, de, dist)
+            ve, vn = self._vel_toward_goal(dn, de, dist)
             self.get_logger().info(
                 f'gps=({self.gps.latitude:.7f},{self.gps.longitude:.7f})  '
-                f'dist={dist:.1f}m  vx={vx:.2f}  vy={vy:.2f}',
+                f'dist={dist:.1f}m  ve={ve:.2f}  vn={vn:.2f}',
                 throttle_duration_sec=1.0,
             )
-            self._publish_vel(vx=vx, vy=vy, vz=self._vz_hold())
+            self._publish_vel(vx=ve, vy=vn, vz=self._vz_hold())
             rclpy.spin_once(self, timeout_sec=dt)
 
             if self._rc_override():
