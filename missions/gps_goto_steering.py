@@ -256,8 +256,14 @@ class GpsGotoSteering(Node):
         self.get_logger().info(f'Pre-streaming setpoints for {PRESTREAM_TIME:.0f}s...')
         deadline = time.monotonic() + PRESTREAM_TIME
         while time.monotonic() < deadline:
-            self._publish_vel(vz=self._vz_hold())
+            self._publish_vel()
             rclpy.spin_once(self, timeout_sec=dt)
+
+        # Drone has been in AUTO.LOITER for ~2 s and is fully settled — safe to lock altitude.
+        if self.pose is not None:
+            self.target_z      = self.pose.pose.position.z
+            self._alt_integral = 0.0
+            self.get_logger().info(f'Altitude hold target: {self.target_z:.2f} m (ENU)')
 
         self.get_logger().info('Switching to OFFBOARD...')
         self.mode_client.wait_for_service()
@@ -493,11 +499,6 @@ class GpsGotoSteering(Node):
                 self.get_logger().error('Disarmed during climb — aborting.'); return
             rclpy.spin_once(self, timeout_sec=0.1)
         self.get_logger().info(f'Takeoff complete (now in {self.state.mode}).')
-
-        if self.pose is not None:
-            self.target_z      = self.pose.pose.position.z
-            self._alt_integral = 0.0
-            self.get_logger().info(f'Altitude hold target: {self.target_z:.2f} m (ENU)')
 
         result = self._switch_offboard()
         if result is None: return
