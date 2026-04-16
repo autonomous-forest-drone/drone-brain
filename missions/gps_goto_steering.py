@@ -58,10 +58,6 @@ GPS_AVG_SAMPLES  = 20   # unique GPS fixes to average (~4 s at 5 Hz GPS)
 SLOWDOWN_RADIUS    = 3.0   # m   — start slowing down at this distance
 MIN_APPROACH_SPEED = 0.15  # m/s — minimum speed near goal
 
-ALT_KP    = 1.0
-ALT_KI    = 0.3
-ALT_I_MAX = 0.5
-
 PRESTREAM_TIME = 2.0
 SETPOINT_HZ    = 20
 
@@ -119,8 +115,6 @@ class GpsGotoSteering(Node):
         self.gps   = NavSatFix()
         self.gps.status.status = -1
         self.pose           = None
-        self.target_z       = None
-        self._alt_integral  = 0.0
         self._left_rc_modes = False
 
         self.create_subscription(State,       '/mavros/state',                  self._on_state,      state_qos)
@@ -166,15 +160,6 @@ class GpsGotoSteering(Node):
         dn = math.radians(self._goal_lat - self.gps.latitude) * EARTH_R
         de = math.radians(self._goal_lon - self.gps.longitude) * EARTH_R * math.cos(lat_rad)
         return dn, de, math.sqrt(dn * dn + de * de)
-
-    def _vz_hold(self) -> float:
-        if self.target_z is None or self.pose is None:
-            return 0.0
-        dt  = 1.0 / SETPOINT_HZ
-        err = self.target_z - self.pose.pose.position.z
-        self._alt_integral += err * dt
-        self._alt_integral  = max(-ALT_I_MAX, min(ALT_I_MAX, self._alt_integral))
-        return max(-1.0, min(1.0, ALT_KP * err + ALT_KI * self._alt_integral))
 
     def _publish_vel(self, vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0):
         """ENU world-frame velocity: x=east, y=north, z=up."""
@@ -259,17 +244,11 @@ class GpsGotoSteering(Node):
             self._publish_vel()
             rclpy.spin_once(self, timeout_sec=dt)
 
-        # Drone has been in AUTO.LOITER for ~2 s and is fully settled — safe to lock altitude.
-        if self.pose is not None:
-            self.target_z      = self.pose.pose.position.z
-            self._alt_integral = 0.0
-            self.get_logger().info(f'Altitude hold target: {self.target_z:.2f} m (ENU)')
-
         self.get_logger().info('Switching to OFFBOARD...')
         self.mode_client.wait_for_service()
         deadline, last_send = time.monotonic() + _OFFBOARD_TIMEOUT, 0.0
         while time.monotonic() < deadline:
-            self._publish_vel(vz=self._vz_hold())
+            self._publish_vel(vz=0.0)
             if time.monotonic() - last_send >= _CMD_INTERVAL:
                 req = SetMode.Request(); req.custom_mode = 'OFFBOARD'
                 fut = self.mode_client.call_async(req)
@@ -311,7 +290,7 @@ class GpsGotoSteering(Node):
                 return True
 
             yaw_rate = max(-YAW_RATE_MAX, min(YAW_RATE_MAX, err * YAW_KP))
-            self._publish_vel(yaw_rate=yaw_rate, vz=self._vz_hold())
+            self._publish_vel(yaw_rate=yaw_rate, vz=0.0)
             self.get_logger().info(
                 f'yaw_err={math.degrees(err):.1f}°  rate={yaw_rate:.2f} rad/s',
                 throttle_duration_sec=0.5)
@@ -362,7 +341,7 @@ class GpsGotoSteering(Node):
                 f'dist={dist:.1f}m  spd={speed:.2f}  '
                 f'yaw_err={math.degrees(yaw_err):.1f}°  rate={yaw_rate:.2f} rad/s',
                 throttle_duration_sec=1.0)
-            self._publish_vel(vx=ve, vy=vn, yaw_rate=yaw_rate, vz=self._vz_hold())
+            self._publish_vel(vx=ve, vy=vn, yaw_rate=yaw_rate, vz=0.0)
             rclpy.spin_once(self, timeout_sec=dt)
 
             if self._rc_override():
@@ -520,7 +499,7 @@ class GpsGotoSteering(Node):
         dt = 1.0 / SETPOINT_HZ
         deadline = time.monotonic() + HOVER_TIME
         while time.monotonic() < deadline:
-            self._publish_vel(vz=self._vz_hold())
+            self._publish_vel(vz=0.0)
             rclpy.spin_once(self, timeout_sec=dt)
             if self._rc_override(): return
 
