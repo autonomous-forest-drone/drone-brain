@@ -177,10 +177,10 @@ class GpsGotoSteering(Node):
         return max(-1.0, min(1.0, ALT_KP * err + ALT_KI * self._alt_integral))
 
     def _publish_vel(self, vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0):
-        """Body-frame velocity: x=forward, y=left, z=up."""
+        """ENU world-frame velocity: x=east, y=north, z=up."""
         msg = TwistStamped()
         msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_link'
+        msg.header.frame_id = 'map'
         msg.twist.linear.x  = vx
         msg.twist.linear.y  = vy
         msg.twist.linear.z  = vz
@@ -354,11 +354,15 @@ class GpsGotoSteering(Node):
             speed = CRUISE_SPEED if dist > SLOWDOWN_RADIUS \
                 else max(MIN_APPROACH_SPEED, CRUISE_SPEED * (dist / SLOWDOWN_RADIUS))
 
+            yaw = self._yaw_from_pose()
+            ve  = speed * math.cos(yaw)
+            vn  = speed * math.sin(yaw)
+
             self.get_logger().info(
                 f'dist={dist:.1f}m  spd={speed:.2f}  '
                 f'yaw_err={math.degrees(yaw_err):.1f}°  rate={yaw_rate:.2f} rad/s',
                 throttle_duration_sec=1.0)
-            self._publish_vel(vx=speed, yaw_rate=yaw_rate, vz=self._vz_hold())
+            self._publish_vel(vx=ve, vy=vn, yaw_rate=yaw_rate, vz=self._vz_hold())
             rclpy.spin_once(self, timeout_sec=dt)
 
             if self._rc_override():
