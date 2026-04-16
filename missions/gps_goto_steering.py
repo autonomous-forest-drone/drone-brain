@@ -256,14 +256,14 @@ class GpsGotoSteering(Node):
         self.get_logger().info(f'Pre-streaming setpoints for {PRESTREAM_TIME:.0f}s...')
         deadline = time.monotonic() + PRESTREAM_TIME
         while time.monotonic() < deadline:
-            self._publish_vel()
+            self._publish_vel(vz=self._vz_hold())
             rclpy.spin_once(self, timeout_sec=dt)
 
         self.get_logger().info('Switching to OFFBOARD...')
         self.mode_client.wait_for_service()
         deadline, last_send = time.monotonic() + _OFFBOARD_TIMEOUT, 0.0
         while time.monotonic() < deadline:
-            self._publish_vel()
+            self._publish_vel(vz=self._vz_hold())
             if time.monotonic() - last_send >= _CMD_INTERVAL:
                 req = SetMode.Request(); req.custom_mode = 'OFFBOARD'
                 fut = self.mode_client.call_async(req)
@@ -494,15 +494,15 @@ class GpsGotoSteering(Node):
             rclpy.spin_once(self, timeout_sec=0.1)
         self.get_logger().info(f'Takeoff complete (now in {self.state.mode}).')
 
-        result = self._switch_offboard()
-        if result is None: return
-        if not result:
-            self.get_logger().error('Failed to enter OFFBOARD — aborting.'); return
-
         if self.pose is not None:
             self.target_z      = self.pose.pose.position.z
             self._alt_integral = 0.0
             self.get_logger().info(f'Altitude hold target: {self.target_z:.2f} m (ENU)')
+
+        result = self._switch_offboard()
+        if result is None: return
+        if not result:
+            self.get_logger().error('Failed to enter OFFBOARD — aborting.'); return
 
         result = self._align_yaw()
         if result is None: return
