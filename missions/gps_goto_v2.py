@@ -535,11 +535,21 @@ class GpsGotoV2(Node):
         dist = math.sqrt(dn * dn + de * de)
         self._target_yaw = math.atan2(dn, de)
 
+        # Goal in EKF local frame: anchor GPS offset to current EKF pose.
+        # PX4's EKF local frame origin != home position, so we cannot use home
+        # as the reference. Instead: goal_ekf = drone_ekf + GPS_offset_to_goal.
+        # This is computed once on the ground while the drone is stationary.
+        self._goal_local_e = self.pose.pose.position.x + de
+        self._goal_local_n = self.pose.pose.position.y + dn
+
         self.get_logger().info(
             f'Goal: ({self._goal_lat:.7f}, {self._goal_lon:.7f})  distance: {dist:.1f} m')
         self.get_logger().info(
             f'Bearing: {math.degrees(self._target_yaw):.1f}° ENU  '
             f'({90.0 - math.degrees(self._target_yaw):.1f}° NED compass)')
+        self.get_logger().info(
+            f'Goal in EKF frame: ({self._goal_local_e:.2f}, {self._goal_local_n:.2f})  '
+            f'drone EKF: ({self.pose.pose.position.x:.2f}, {self.pose.pose.position.y:.2f})')
         self.get_logger().info('Press Enter to arm and take off.')
 
         # Wait for Enter
