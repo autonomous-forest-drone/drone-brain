@@ -150,8 +150,9 @@ class GpsGotoV2(Node):
     def _on_pose(self, msg):       self.pose = msg
 
     def _on_home(self, msg):
+        first = self._home is None
         self._home = msg
-        if self._goal_lat is not None and self._goal_lon is not None:
+        if first and self._goal_lat is not None and self._goal_lon is not None:
             self._update_goal_local()
 
     # ------------------------------------------------------------------ helpers
@@ -386,7 +387,11 @@ class GpsGotoV2(Node):
             vn = (dn / dist) * speed
 
             self.get_logger().info(
-                f'dist={dist:.1f}m  spd={speed:.2f}  ve={ve:.2f}  vn={vn:.2f}',
+                f'dist={dist:.1f}m  spd={speed:.2f}  '
+                f'yaw={math.degrees(self._yaw_from_pose()):.1f}°  '
+                f'alt={self.pose.pose.position.z:.2f}m  '
+                f'ekf=({self.pose.pose.position.x:.2f},{self.pose.pose.position.y:.2f})  '
+                f'gps=({self.gps.latitude:.7f},{self.gps.longitude:.7f})',
                 throttle_duration_sec=1.0)
             self._publish_vel(vx=ve, vy=vn, vz=0.0)
             rclpy.spin_once(self, timeout_sec=dt)
@@ -544,8 +549,11 @@ class GpsGotoV2(Node):
             while True:
                 rclpy.spin_once(self, timeout_sec=0.05)
                 if select.select([sys.stdin], [], [], 0)[0]:
-                    if sys.stdin.read(1) in ('\r', '\n'):
+                    ch = sys.stdin.read(1)
+                    if ch in ('\r', '\n'):
                         break
+                    if ch == '\x03':   # Ctrl+C in raw mode
+                        raise KeyboardInterrupt
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
