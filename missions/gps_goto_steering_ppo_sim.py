@@ -55,12 +55,12 @@ from sensor_msgs.msg import NavSatFix
 #
 MOCK_SEQUENCE = [
     # start   end    ppo    label
-    (  0.0,   5.0,   0.0,  'straight'),
-    (  5.0,   6.0,   0.3,  'obstacle — slight right'),
-    (  6.0,   7.5,   0.5,  'obstacle — right'),
-    (  7.5,   9.0,   0.7,  'obstacle — hard right'),
-    (  9.0,  10.5,   0.3,  'obstacle — tapering off'),
-    ( 10.5,  float('inf'), 0.0, 'obstacle cleared'),
+    (  0.0,   2.0,   0.0,  'straight'),
+    (  2.0,   2.5,   0.5,  'obstacle — slight right'),
+    (  2.5,   3.0,   0.7,  'obstacle — right'),
+    (  3.0,   3.5,   1,  'obstacle — hard right'),
+    (  3.5,  4.0,   0.7,  'obstacle — tapering off'),
+    ( 4.0,  float('inf'), 0.0, 'obstacle cleared'),
 ]
 
 
