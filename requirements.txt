@@ -1,0 +1,36 @@
+# -----------------------------------------------------------------------
+# drone-brain — Python dependencies
+#
+# Install with:  pip install -r requirements.txt
+#
+# NOT listed here (installed via apt / JetPack):
+#   tensorrt          — ships with JetPack / TensorRT SDK
+#   pycuda            — see note below; may need apt on Jetson
+#   rclpy             — ros-humble-rclpy
+#   cv_bridge         — ros-humble-cv-bridge
+#   geometry_msgs     — ros-humble-geometry-msgs
+#   mavros_msgs       — ros-humble-mavros
+#   nav_msgs          — ros-humble-nav-msgs
+#   sensor_msgs       — ros-humble-sensor-msgs
+#   visualization_msgs — ros-humble-visualization-msgs
+# -----------------------------------------------------------------------
+
+# --- core (freerider runtime + fortune cookie) --------------------------
+numpy
+opencv-python           # cv2
+Pillow                  # PIL — used by depth estimator
+torch                   # On Jetson use the JetPack wheel, not PyPI:
+                        #   pip install torch --index-url https://pypi.jetson-ai-lab.dev/jp6/cu126
+torchvision             # On Jetson install alongside torch (same index URL)
+transformers            # Depth Anything V2 Small (HuggingFace)
+
+# --- pycuda (TRT inference) --------------------------------------------
+# On Jetson prefer: sudo apt install python3-pycuda
+# Fallback pip build (requires CUDA headers):
+pycuda
+
+# --- export script (models/freerider/helpers/export_freerider_trt.py) --
+stable-baselines3       # PPO.load() — only needed to run the export script
+
+# --- sensor tests -------------------------------------------------------
+pymavlink               # tests/sensor_tests/probe_baud.py
