@@ -31,6 +31,7 @@ pycuda
 
 # --- export script (models/freerider/helpers/export_freerider_trt.py) --
 stable-baselines3       # PPO.load() — only needed to run the export script
+onnx                    # required by torch.onnx.export()
 
 # --- sensor tests -------------------------------------------------------
 pymavlink               # tests/sensor_tests/probe_baud.py
