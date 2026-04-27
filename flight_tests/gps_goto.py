@@ -3,7 +3,6 @@ GPS goto mission with continuous yaw steering v2.
 
 arm → AUTO.TAKEOFF → OFFBOARD → fly to goal → hover → AUTO.LAND.
 
-Improvements over gps_goto_steering.py:
   - Distance/bearing uses EKF local_position/pose (IMU-smoothed, ~50 Hz) instead of
     raw GPS (noisy, 1–5 Hz). Goal is converted to local ENU once after home arrives.
   - GPS quality gate before arming: waits for covariance < 9 m² (HDOP ~3) and
