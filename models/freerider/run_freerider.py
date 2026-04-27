@@ -44,6 +44,7 @@ import numpy as np
 import pycuda.autoinit  # noqa: F401 — initialises CUDA context
 import pycuda.driver as cuda
 import rclpy
+from cv_bridge import CvBridge
 from geometry_msgs.msg import TwistStamped
 from mavros_msgs.msg import State, StatusText
 from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
@@ -51,6 +52,7 @@ from nav_msgs.msg import Odometry
 from PIL import Image as PILImage
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Image as RosImage
 import tensorrt as trt
 import torch
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
@@ -80,6 +82,8 @@ _ARM_TIMEOUT      = 30.0
 _TAKEOFF_TIMEOUT  = 30.0
 _OFFBOARD_TIMEOUT = 10.0
 RC_OVERRIDE_MODES = {'ALTCTL', 'POSCTL'}
+SIM_FCU_URL       = 'udp://:14540@127.0.0.1:14580'
+SIM_IMAGE_TOPIC   = '/airsim_node/drone_1/front_center_custom/Scene'
 
 
 # ---------------------------------------------------------------------------
@@ -185,9 +189,10 @@ class DepthEstimator:
 
 class FreeriderNode(Node):
 
-    def __init__(self, engine_path: str):
+    def __init__(self, engine_path: str, sim: bool = False, sim_image_topic: str = SIM_IMAGE_TOPIC):
         super().__init__('freerider')
 
+        self._sim            = sim
         self.state           = State()
         self._left_rc_modes  = False
         self._yaw            = 0.0
@@ -205,6 +210,11 @@ class FreeriderNode(Node):
         self.create_subscription(State,      '/mavros/state',               self._on_state,      state_qos)
         self.create_subscription(StatusText, '/mavros/statustext',          self._on_statustext, qos)
         self.create_subscription(Odometry,   '/mavros/local_position/odom', self._on_odom,       qos)
+
+        if sim:
+            self._bridge = CvBridge()
+            self.create_subscription(RosImage, sim_image_topic, self._on_sim_image, qos)
+            self.get_logger().info(f'[Freerider] Sim mode — camera from {sim_image_topic}')
 
         self.arm_client  = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.mode_client = self.create_client(SetMode,     '/mavros/set_mode')
@@ -234,6 +244,15 @@ class FreeriderNode(Node):
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self._yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+    def _on_sim_image(self, msg):
+        """Receive a ROS Image from the simulator and store it as BGR."""
+        try:
+            bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            with self._frame_lock:
+                self._latest_bgr = bgr
+        except Exception as e:
+            self.get_logger().warn(f'[Freerider] sim image conversion failed: {e}')
 
     # ------------------------------------------------------------------
     # RC override
@@ -353,6 +372,9 @@ class FreeriderNode(Node):
     # ------------------------------------------------------------------
 
     def _start_camera(self):
+        if self._sim:
+            self.get_logger().info('[Freerider] Sim mode — using ROS image topic, skipping GStreamer.')
+            return
         threading.Thread(target=self._camera_reader, daemon=True).start()
 
     def _camera_reader(self):
@@ -380,10 +402,11 @@ class FreeriderNode(Node):
         writer.release()
         cap.release()
         self.get_logger().info('Recording saved.')
-        subprocess.Popen(
-            ['rclone', 'copy', VIDEO_DIR, 'dropbox:freerider/debug_frames'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        if not self._sim:
+            subprocess.Popen(
+                ['rclone', 'copy', VIDEO_DIR, 'dropbox:freerider/debug_frames'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
 
     def _get_frame(self):
         with self._frame_lock:
@@ -396,13 +419,14 @@ class FreeriderNode(Node):
     def _avoidance_step(self, frame_stack: deque, smoothed_action: float):
         """Estimate depth, run TRT policy, publish velocity.
 
-        Returns (frame_stack, raw_action, new_smoothed_action, lateral_vel).
-        Returns the unchanged smoothed_action and 0.0 lateral if no frame
-        is available yet.
+        Returns (frame_stack, raw_action, new_smoothed_action, lateral_vel, step_latency_ms).
+        Returns unchanged smoothed_action, 0.0 lateral and 0.0 latency if no frame yet.
         """
         bgr = self._get_frame()
         if bgr is None:
-            return frame_stack, smoothed_action, smoothed_action, 0.0
+            return frame_stack, smoothed_action, smoothed_action, 0.0, 0.0
+
+        t_step_start = time.monotonic()
 
         depth = self._depth.estimate(bgr)   # (144, 256) float32 [0, 1]
         frame_stack.append(depth)
@@ -421,7 +445,9 @@ class FreeriderNode(Node):
         lat = MAX_LATERAL * new_smoothed
         self._publish_vel(vx=fwd, vy=lat)
 
-        return frame_stack, raw_action, new_smoothed, lat
+        step_latency_ms = (time.monotonic() - t_step_start) * 1000.0
+
+        return frame_stack, raw_action, new_smoothed, lat, step_latency_ms
 
     # ------------------------------------------------------------------
     # Main run sequence
@@ -436,11 +462,11 @@ class FreeriderNode(Node):
         while not self.state.connected and time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
 
+        fcu_url = SIM_FCU_URL if self._sim else '/dev/ttyTHS1:921600'
         if not self.state.connected:
             self.get_logger().info('MAVROS not connected — launching...')
             subprocess.Popen(
-                ['ros2', 'launch', 'mavros', 'px4.launch',
-                 'fcu_url:=/dev/ttyTHS1:921600'],
+                ['ros2', 'launch', 'mavros', 'px4.launch', f'fcu_url:={fcu_url}'],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
 
@@ -448,18 +474,21 @@ class FreeriderNode(Node):
         while not self.state.connected:
             rclpy.spin_once(self, timeout_sec=0.1)
 
-        self.get_logger().info('Connected. Press any key to arm and take off.')
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            while True:
-                rclpy.spin_once(self, timeout_sec=0.05)
-                if select.select([sys.stdin], [], [], 0)[0]:
-                    sys.stdin.read(1)
-                    break
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        if self._sim:
+            self.get_logger().info('Sim mode — starting automatically.')
+        else:
+            self.get_logger().info('Connected. Press any key to arm and take off.')
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                while True:
+                    rclpy.spin_once(self, timeout_sec=0.05)
+                    if select.select([sys.stdin], [], [], 0)[0]:
+                        sys.stdin.read(1)
+                        break
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
         if not self._arm():
             self.get_logger().error('Failed to arm — aborting.')
@@ -492,12 +521,13 @@ class FreeriderNode(Node):
         log_path = os.path.join(LOG_DIR, f'flight_{stamp}.csv')
         log_file = open(log_path, 'w', newline='')
         csv_writer = csv.writer(log_file)
-        csv_writer.writerow(['t', 'raw_action', 'smoothed_action', 'lateral_vel_ms'])
+        csv_writer.writerow(['t', 'raw_action', 'smoothed_action', 'lateral_vel_ms', 'step_latency_ms'])
 
         self.get_logger().info('Freerider avoidance active. RC override to exit.')
         frame_stack     = deque(maxlen=N_FRAMES)
         smoothed_action = 0.0
         t0              = time.monotonic()
+        latencies       = []
 
         try:
             while True:
@@ -508,21 +538,33 @@ class FreeriderNode(Node):
                 if not self.state.armed:
                     self.get_logger().info('Disarmed — stopping.')
                     break
-                frame_stack, raw_action, smoothed_action, lat = self._avoidance_step(
+                frame_stack, raw_action, smoothed_action, lat, latency_ms = self._avoidance_step(
                     frame_stack, smoothed_action,
                 )
+                if latency_ms > 0.0:
+                    latencies.append(latency_ms)
                 csv_writer.writerow([
                     f'{time.monotonic() - t0:.3f}',
                     f'{raw_action:.4f}',
                     f'{smoothed_action:.4f}',
                     f'{lat:.4f}',
+                    f'{latency_ms:.1f}',
                 ])
         finally:
             log_file.close()
-            subprocess.Popen(
-                ['rclone', 'copy', LOG_DIR, 'dropbox:freerider/logs'],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
+            if latencies:
+                avg_ms = sum(latencies) / len(latencies)
+                self.get_logger().info(
+                    f'Step latency — avg: {avg_ms:.1f} ms  '
+                    f'min: {min(latencies):.1f} ms  '
+                    f'max: {max(latencies):.1f} ms  '
+                    f'({len(latencies)} steps)'
+                )
+            if not self._sim:
+                subprocess.Popen(
+                    ['rclone', 'copy', LOG_DIR, 'dropbox:freerider/logs'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
 
         self._land()
         self._recording = False
@@ -539,16 +581,31 @@ def main():
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'freerider_actor.trt'),
         help='Path to TensorRT engine (.trt)',
     )
+    parser.add_argument(
+        '--sim',
+        action='store_true',
+        help='Simulation mode: connect via UDP, skip keypress, use ROS image topic for camera.',
+    )
+    parser.add_argument(
+        '--sim-image-topic',
+        default=SIM_IMAGE_TOPIC,
+        help=f'ROS image topic to use in sim mode (default: {SIM_IMAGE_TOPIC})',
+    )
     args = parser.parse_args()
 
     print('=' * 60)
     print('Freerider — PPO Obstacle Avoidance')
     print(f'Engine : {args.engine}')
-    print('RC override: switch to ALTCTL or POSCTL at any time')
+    if args.sim:
+        print(f'Mode   : Simulation (PX4 SITL via {SIM_FCU_URL})')
+        print(f'Camera : {args.sim_image_topic}')
+    else:
+        print('Mode   : Real hardware')
+        print('RC override: switch to ALTCTL or POSCTL at any time')
     print('=' * 60)
 
     rclpy.init()
-    node = FreeriderNode(args.engine)
+    node = FreeriderNode(args.engine, sim=args.sim, sim_image_topic=args.sim_image_topic)
     try:
         node.run()
     except KeyboardInterrupt:
