@@ -3,17 +3,13 @@
 Export the best PPO Freerider actor to ONNX then TensorRT FP16.
 
 Usage (run on the Jetson — trtexec output is GPU-specific):
-    python export_freerider_trt.py \\
-        --checkpoint /path/to/best_avoidance_v5_*.zip \\
-        --out_dir    ~/freerider/models
+    python export_freerider_trt.py
 
-    # Or let the script auto-discover the newest best checkpoint:
-    python export_freerider_trt.py \\
-        --search_dir /path/to/ppo-cnn-drone-navigation/src/v5/models_v5
-
-Outputs:
-    <out_dir>/freerider_actor.onnx
-    <out_dir>/freerider_actor.trt
+Place the SB3 checkpoint zip inside freerider/model/ before running.
+The script picks the single .zip found there and writes the outputs
+alongside it:
+    freerider/model/freerider_actor.onnx
+    freerider/model/freerider_actor.trt
 
 Architecture (v5 actor path):
     image (1, 3, 144, 256) ──► CNN ──► Linear(cnn_out, 256)+ReLU ──┐
@@ -30,17 +26,34 @@ import os
 import subprocess
 import sys
 
-import numpy as np
 import torch
 import torch.nn as nn
 
 # ---------------------------------------------------------------------------
-# Locate v5 source so train.py custom classes can be imported by SB3
+# Paths
 # ---------------------------------------------------------------------------
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR     = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'model'))
 V5_SRC_DEFAULT = os.path.abspath(
     os.path.join(SCRIPT_DIR, '..', '..', '..', 'ppo-cnn-drone-navigation', 'src', 'v5')
 )
+
+
+def find_checkpoint_in_model_dir() -> str:
+    """Return the single .zip file in freerider/model/. Raises if none or many."""
+    zips = glob.glob(os.path.join(MODEL_DIR, '*.zip'))
+    if not zips:
+        raise FileNotFoundError(
+            f'No .zip checkpoint found in {MODEL_DIR}\n'
+            'Copy your SB3 checkpoint zip there and re-run.'
+        )
+    if len(zips) > 1:
+        raise RuntimeError(
+            f'Multiple .zip files found in {MODEL_DIR}:\n'
+            + '\n'.join(f'  {z}' for z in zips)
+            + '\nLeave only one checkpoint zip and re-run.'
+        )
+    return zips[0]
 
 
 class FreeriderActorWrapper(nn.Module):
@@ -69,28 +82,12 @@ class FreeriderActorWrapper(nn.Module):
         return self.action_net(latent)            # (B, 1)
 
 
-def find_best_checkpoint(search_dir: str) -> str:
-    """Return the most-recently-modified best-model zip under search_dir."""
-    pattern = os.path.join(search_dir, '**', 'best_avoidance_v5_*.zip')
-    matches = glob.glob(pattern, recursive=True)
-    if not matches:
-        raise FileNotFoundError(
-            f'No best-model checkpoints found under {search_dir}\n'
-            f'Pattern tried: {pattern}'
-        )
-    return max(matches, key=os.path.getmtime)
-
-
 def main():
     parser = argparse.ArgumentParser(description='Export Freerider actor → ONNX → TensorRT FP16')
-    parser.add_argument('--checkpoint',  default=None,
-                        help='Direct path to .zip SB3 checkpoint')
-    parser.add_argument('--search_dir',  default=None,
-                        help='Root to search for checkpoint (default: auto-resolved models_v5 dir)')
-    parser.add_argument('--v5_src',      default=V5_SRC_DEFAULT,
+    parser.add_argument('--v5_src',  default=V5_SRC_DEFAULT,
                         help='Path to ppo-cnn-drone-navigation/src/v5 (for custom class imports)')
-    parser.add_argument('--out_dir',     default=os.path.join(SCRIPT_DIR, 'models'),
-                        help='Output directory for ONNX and TRT files')
+    parser.add_argument('--out_dir', default=MODEL_DIR,
+                        help='Output directory for ONNX and TRT files (default: freerider/model/)')
     args = parser.parse_args()
 
     # Add v5 source to path so SB3 can resolve custom classes on load
@@ -100,15 +97,9 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # Locate checkpoint
+    # Locate checkpoint — must be manually placed in freerider/model/
     # ------------------------------------------------------------------
-    if args.checkpoint:
-        ckpt_path = args.checkpoint
-    else:
-        search_root = args.search_dir or os.path.join(args.v5_src, 'models_v5')
-        print(f'[export] Auto-discovering checkpoint under: {search_root}')
-        ckpt_path = find_best_checkpoint(search_root)
-
+    ckpt_path = find_checkpoint_in_model_dir()
     print(f'[export] Loading checkpoint: {ckpt_path}')
 
     # ------------------------------------------------------------------
