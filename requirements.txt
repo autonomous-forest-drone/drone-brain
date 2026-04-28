@@ -5,7 +5,7 @@
 #
 # NOT listed here (installed via apt / JetPack):
 #   tensorrt          — ships with JetPack / TensorRT SDK
-#   pycuda            — see note below; may need apt on Jetson
+#   pycuda            — install via apt, NOT pip (see section below)
 #   rclpy             — ros-humble-rclpy
 #   cv_bridge         — ros-humble-cv-bridge
 #   geometry_msgs     — ros-humble-geometry-msgs
@@ -25,9 +25,9 @@ torchvision             # On Jetson install alongside torch (same index URL)
 transformers            # Depth Anything V2 Small (HuggingFace)
 
 # --- pycuda (TRT inference) --------------------------------------------
-# On Jetson prefer: sudo apt install python3-pycuda
-# Fallback pip build (requires CUDA headers):
-pycuda
+# On Jetson ALWAYS install via apt — pip build will silently fail:
+#   sudo apt install python3-pycuda
+# pycuda   ← intentionally commented out, apt only
 
 # --- export script (models/freerider/helpers/export_freerider_trt.py) --
 stable-baselines3       # PPO.load() — only needed to run the export script

@@ -82,7 +82,7 @@ _ARM_TIMEOUT      = 30.0
 _TAKEOFF_TIMEOUT  = 30.0
 _OFFBOARD_TIMEOUT = 10.0
 RC_OVERRIDE_MODES = {'ALTCTL', 'POSCTL'}
-SIM_FCU_URL       = 'udp://:14540@127.0.0.1:14580'
+SIM_FCU_URL       = 'udp://:14540@194.47.28.91:14580'
 SIM_IMAGE_TOPIC   = '/airsim_node/drone_1/front_center_custom/Scene'
 
 
