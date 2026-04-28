@@ -462,7 +462,7 @@ class FreeriderNode(Node):
         while not self.state.connected and time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
 
-        fcu_url = SIM_FCU_URL if self._sim else '/dev/ttyTHS1:921600'
+        fcu_url = SIM_FCU_URL if self._sim else '/dev/ttyTHS1:115200'
         if not self.state.connected:
             self.get_logger().info('MAVROS not connected — launching...')
             subprocess.Popen(
