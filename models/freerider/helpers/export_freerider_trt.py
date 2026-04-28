@@ -152,6 +152,14 @@ class FreeriderActorWrapper(nn.Module):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _which(cmd: str) -> bool:
+    """Return True if cmd exists as an absolute path or is found on PATH."""
+    if os.path.isabs(cmd):
+        return os.path.isfile(cmd) and os.access(cmd, os.X_OK)
+    import shutil
+    return shutil.which(cmd) is not None
+
+
 def find_checkpoint_in_model_dir() -> str:
     """Return the single .zip file in freerider/model/. Raises if none or many."""
     zips = glob.glob(os.path.join(MODEL_DIR, '*.zip'))
@@ -246,10 +254,21 @@ def main():
     # ------------------------------------------------------------------
     # TensorRT FP16 conversion
     # ------------------------------------------------------------------
-    trt_path = os.path.join(args.out_dir, 'freerider_actor.trt')
+    trt_path   = os.path.join(args.out_dir, 'freerider_actor.trt')
+    trtexec_candidates = [
+        'trtexec',                              # on PATH (desktop / venv)
+        '/usr/src/tensorrt/bin/trtexec',        # JetPack default
+        '/usr/local/bin/trtexec',
+    ]
+    trtexec = next((p for p in trtexec_candidates if _which(p)), None)
+    if trtexec is None:
+        raise FileNotFoundError(
+            'trtexec not found. Add it to PATH or install TensorRT.\n'
+            f'Searched: {trtexec_candidates}'
+        )
     print(f'[export] Converting to TensorRT FP16 → {trt_path}')
     cmd = [
-        'trtexec',
+        trtexec,
         f'--onnx={onnx_path}',
         f'--saveEngine={trt_path}',
         '--fp16',
