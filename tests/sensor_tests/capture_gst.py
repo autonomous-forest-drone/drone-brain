@@ -21,8 +21,9 @@ from datetime import datetime
 SAVE_DIR = "images"
 FRAME_DIR = "/tmp/af_frames"
 INITIAL_FOCUS = 300
-FOCUS_STEP = 20
-FOCUS_RANGE = 100   # +/- around current focus
+COARSE_STEP = 50    # step size for full-range coarse scan
+FINE_STEP = 10      # step size for fine scan around coarse peak
+FINE_RANGE = 60     # +/- around coarse peak for fine scan
 SETTLE_TIME = 0.2   # seconds for lens to move and a fresh frame to arrive
 CAPTURE_WIDTH = 1920
 CAPTURE_HEIGHT = 1080
@@ -76,33 +77,37 @@ def sharpness(image):
 
 
 # -------- AUTOFOCUS --------
-def autofocus(current_focus):
-    """
-    Scans +/- FOCUS_RANGE around current_focus and picks the sharpest position.
-    The persistent pipeline keeps the camera powered so i2cset reaches the VCM.
-    """
-    best_focus = current_focus
+def scan(start, stop, step):
+    """Scan focus values from start to stop (inclusive) and return (best_focus, best_score)."""
+    best_focus = start
     best_score = -1
-
-    for f in range(current_focus - FOCUS_RANGE,
-                   current_focus + FOCUS_RANGE + FOCUS_STEP,
-                   FOCUS_STEP):
-
+    for f in range(start, stop + step, step):
+        f = max(0, min(1000, f))
         set_focus(f)
-        time.sleep(SETTLE_TIME)  # lens settles + fresh frame arrives at 30fps
-
+        time.sleep(SETTLE_TIME)
         frame = capture_frame()
         if frame is None:
             continue
         score = sharpness(frame)
-        print(f"  focus={f:4d}  sharpness={score:.1f}")
-
+        print(f"  focus={f:4d}  sharpness={score:.2f}")
         if score > best_score:
             best_score = score
             best_focus = f
+    return best_focus, best_score
 
-    set_focus(best_focus)
-    return best_focus
+
+def autofocus():
+    """Two-pass autofocus: coarse scan 0–1000, then fine scan around the peak."""
+    print("  [coarse scan]")
+    coarse_best, _ = scan(0, 1000, COARSE_STEP)
+
+    fine_start = max(0, coarse_best - FINE_RANGE)
+    fine_stop = min(1000, coarse_best + FINE_RANGE)
+    print(f"  [fine scan around {coarse_best}]")
+    fine_best, _ = scan(fine_start, fine_stop, FINE_STEP)
+
+    set_focus(fine_best)
+    return fine_best
 
 
 # -------- MAIN --------
@@ -118,12 +123,8 @@ def main():
             raise RuntimeError("Pipeline started but no frames received.")
         print("Camera OK.")
 
-        print(f"Setting initial focus: {INITIAL_FOCUS}")
-        set_focus(INITIAL_FOCUS)
-        time.sleep(0.5)
-
         print("Running autofocus...")
-        best_focus = autofocus(INITIAL_FOCUS)
+        best_focus = autofocus()
         print(f"Best focus: {best_focus}")
 
         print("Capturing final image...")
