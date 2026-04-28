@@ -2,33 +2,36 @@
 """
 FREERIDER — PPO obstacle avoidance flight script.
 
-Mirrors the DANI run_tree_avoid.py pattern, adapted for the Freerider policy:
   • Depth Anything V2 Small (HuggingFace transformers) for monocular depth
   • Freerider actor (TensorRT FP16) with two inputs: image stack + state
   • 3-frame depth stack  (3 × 144 × 256)
   • Action smoothing matching training: smoothed = 0.7 * raw + 0.3 * prev
+  • Two-pass autofocus on hover after takeoff (real hardware only)
+  • Per-flight logs: flight_logs/<timestamp>/{frames/, depth/, flight.csv, flight.png}
 
-Velocity (body frame, matches avoidance_env.py):
-    fwd = 1.0 - 0.8 * |smoothed|   (always positive, slows near obstacles)
-    lat = 0.8 * smoothed
+Camera (real hardware):
+  Uses a persistent gst-launch-1.0 pipeline writing JPEGs to /tmp/af_frames/
+  (same approach as capture_gst.py — required for VCM motor to respond).
+
+Velocity (body frame):
+    fwd = FIXED_SPEED - MAX_LATERAL * |smoothed|
+    lat = MAX_LATERAL * smoothed
 
 Flow:
     wait for MAVROS → keypress → arm → AUTO.TAKEOFF → wait climb
-    → OFFBOARD → avoidance loop until RC override → AUTO.LAND
+    → start camera pipeline → OFFBOARD → autofocus hover
+    → avoidance loop until RC override → AUTO.LAND
 
 RC override: switching to ALTCTL or POSCTL at any time exits the loop.
 
 Usage:
-    python run_freerider.py --engine ~/freerider/model/freerider_actor.trt
-
-Requirements (Jetson):
-    pip install transformers torch torchvision pillow pycuda
-    sudo apt install tensorrt python3-tensorrt
-    ROS 2 Humble + MAVROS
+    python run_freerider.py
+    python run_freerider.py --sim
 """
 
 import argparse
 import csv
+import glob
 import os
 import select
 import subprocess
@@ -62,21 +65,16 @@ from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 # ---------------------------------------------------------------------------
 SETPOINT_HZ     = 10
 PRESTREAM_TIME  = 2.0
-LOG_DIR         = os.path.expanduser('~/freerider/logs')
-VIDEO_DIR       = os.path.expanduser('~/freerider/debug_frames')
+FLIGHT_LOG_ROOT = os.path.expanduser('~/drone-brain/flight_logs')
 DEPTH_MODEL_ID  = 'depth-anything/Depth-Anything-V2-Small-hf'
 IMG_H, IMG_W    = 144, 256
 N_FRAMES        = 3
-FIXED_SPEED     = 1.0   # m/s forward (matches avoidance_env fixed_speed)
-MAX_LATERAL     = 0.8   # m/s lateral (matches avoidance_env max_lateral)
-ACTION_MOMENTUM = 0.3   # matches avoidance_env ACTION_MOMENTUM
-SMOOTH_ALPHA    = 1.0 - ACTION_MOMENTUM  # 0.7
-GST_PIPELINE = (
-    'nvarguscamerasrc ! '
-    'video/x-raw(memory:NVMM), width=1920, height=1080, framerate=30/1 ! '
-    'nvvidconv ! video/x-raw, format=BGRx ! '
-    'videoconvert ! video/x-raw, format=BGR ! appsink'
-)
+FIXED_SPEED     = 1.0
+MAX_LATERAL     = 0.8
+ACTION_MOMENTUM = 0.3
+SMOOTH_ALPHA    = 1.0 - ACTION_MOMENTUM   # 0.7
+RGB_SAVE_EVERY  = 5                       # save raw RGB every N steps (~2 Hz at 10 Hz)
+
 _CMD_INTERVAL     = 2.0
 _ARM_TIMEOUT      = 30.0
 _TAKEOFF_TIMEOUT  = 30.0
@@ -85,19 +83,89 @@ RC_OVERRIDE_MODES = {'ALTCTL', 'POSCTL'}
 SIM_FCU_URL       = 'udp://:14540@194.47.28.91:14580'
 SIM_IMAGE_TOPIC   = '/airsim_node/drone_1/front_center_custom/Scene'
 
+# ---------------------------------------------------------------------------
+# Camera / autofocus constants (real hardware — Arducam IMX477 + VCM motor)
+# ---------------------------------------------------------------------------
+FRAME_DIR      = '/tmp/af_frames'
+CAPTURE_WIDTH  = 1920
+CAPTURE_HEIGHT = 1080
+I2C_BUS        = 9       # VCM motor bus — active only while Argus session runs
+VCM_ADDR       = 0x0C
+COARSE_STEP    = 50
+FINE_STEP      = 10
+FINE_RANGE     = 60
+SETTLE_TIME    = 0.2     # seconds to wait after moving lens before reading frame
+INITIAL_FOCUS  = 300
+
+
+# ---------------------------------------------------------------------------
+# Camera pipeline helpers (gst-launch-1.0 + multifilesink, same as capture_gst.py)
+# ---------------------------------------------------------------------------
+
+def _start_gst_pipeline() -> subprocess.Popen:
+    """Start a persistent GStreamer pipeline writing JPEG frames to FRAME_DIR."""
+    os.makedirs(FRAME_DIR, exist_ok=True)
+    for f in glob.glob(f'{FRAME_DIR}/frame_*.jpg'):
+        os.remove(f)
+    cmd = (
+        f'gst-launch-1.0 nvarguscamerasrc ! '
+        f"'video/x-raw(memory:NVMM),width={CAPTURE_WIDTH},height={CAPTURE_HEIGHT},"
+        f"framerate=30/1' ! nvvidconv ! jpegenc ! "
+        f'multifilesink location="{FRAME_DIR}/frame_%05d.jpg" max-files=5'
+    )
+    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=None)
+    time.sleep(2.5)   # wait for Argus session to initialise
+    return proc
+
+
+def _latest_frame() -> np.ndarray | None:
+    """Return the most recent JPEG frame from the persistent pipeline, or None."""
+    files = sorted(glob.glob(f'{FRAME_DIR}/frame_*.jpg'))
+    if not files:
+        return None
+    return cv2.imread(files[-1])
+
+
+# ---------------------------------------------------------------------------
+# Autofocus helpers
+# ---------------------------------------------------------------------------
+
+def set_focus(value: int):
+    value  = max(0, min(1000, value))
+    raw    = (value << 4) & 0x3FF0
+    data1  = (raw >> 8) & 0x3F
+    data2  = raw & 0xF0
+    os.system(f'i2cset -y {I2C_BUS} 0x{VCM_ADDR:02X} {data1} {data2}')
+
+
+def _sharpness(bgr: np.ndarray) -> float:
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _focus_scan(start: int, stop: int, step: int, publish_vel_fn) -> tuple[int, float]:
+    """Scan focus values, return (best_focus, best_score)."""
+    best_focus, best_score = start, -1.0
+    for f in range(start, stop + step, step):
+        f = max(0, min(1000, f))
+        publish_vel_fn()   # keep OFFBOARD alive during scan
+        set_focus(f)
+        time.sleep(SETTLE_TIME)
+        frame = _latest_frame()
+        if frame is None:
+            continue
+        score = _sharpness(frame)
+        if score > best_score:
+            best_score = score
+            best_focus = f
+    return best_focus, best_score
+
 
 # ---------------------------------------------------------------------------
 # TensorRT inference wrapper
 # ---------------------------------------------------------------------------
 
 class TRTEngine:
-    """Minimal TensorRT FP16 inference wrapper for the Freerider policy actor.
-
-    Expects the engine to have exactly three tensors named:
-        'image'  — input  (1, 3, 144, 256) float32
-        'state'  — input  (1, 1)           float32
-        'action' — output (1, 1)           float32
-    """
 
     def __init__(self, engine_path: str):
         logger = trt.Logger(trt.Logger.WARNING)
@@ -118,17 +186,6 @@ class TRTEngine:
             self._context.set_tensor_address(name, int(dev))
 
     def infer(self, image_np: np.ndarray, state_np: np.ndarray) -> float:
-        """Run one deterministic forward pass.
-
-        Parameters
-        ----------
-        image_np : (3, 144, 256) float32 — stacked depth frames in [0, 1]
-        state_np : (1,)          float32 — previous smoothed lateral action
-
-        Returns
-        -------
-        float — raw lateral action (caller should clip to [-1, 1])
-        """
         img = self._bindings['image']
         st  = self._bindings['state']
         act = self._bindings['action']
@@ -138,9 +195,7 @@ class TRTEngine:
 
         cuda.memcpy_htod_async(img['dev'], img['host'], self._stream)
         cuda.memcpy_htod_async(st['dev'],  st['host'],  self._stream)
-
         self._context.execute_async_v3(self._stream.handle)
-
         cuda.memcpy_dtoh_async(act['host'], act['dev'], self._stream)
         self._stream.synchronize()
 
@@ -152,11 +207,6 @@ class TRTEngine:
 # ---------------------------------------------------------------------------
 
 class DepthEstimator:
-    """Thin wrapper around Depth Anything V2 Small.
-
-    Output: (IMG_H, IMG_W) float32, per-frame min-max normalised to [0, 1].
-    Higher values = closer obstacles (disparity convention).
-    """
 
     def __init__(self, device: str = 'cuda'):
         print(f'[DepthEstimator] Loading {DEPTH_MODEL_ID} on {device} ...')
@@ -172,7 +222,7 @@ class DepthEstimator:
         inputs = self._processor(images=pil, return_tensors='pt')
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
         with torch.no_grad():
-            raw = self._model(**inputs).predicted_depth  # (1, H, W) disparity
+            raw = self._model(**inputs).predicted_depth
         depth = raw.squeeze().cpu().numpy()
         depth = cv2.resize(depth, (IMG_W, IMG_H), interpolation=cv2.INTER_LINEAR)
         d_min, d_max = float(depth.min()), float(depth.max())
@@ -189,16 +239,25 @@ class DepthEstimator:
 
 class FreeriderNode(Node):
 
-    def __init__(self, engine_path: str, sim: bool = False, sim_image_topic: str = SIM_IMAGE_TOPIC):
+    def __init__(self, engine_path: str, flight_dir: str, sim: bool = False,
+                 sim_image_topic: str = SIM_IMAGE_TOPIC):
         super().__init__('freerider')
 
-        self._sim            = sim
-        self.state           = State()
-        self._left_rc_modes  = False
-        self._yaw            = 0.0
-        self._latest_bgr     = None
-        self._frame_lock     = threading.Lock()
-        self._recording      = False
+        self._sim        = sim
+        self._flight_dir = flight_dir
+        self._frames_dir = os.path.join(flight_dir, 'frames')
+        self._depth_dir  = os.path.join(flight_dir, 'depth')
+        os.makedirs(self._frames_dir, exist_ok=True)
+        os.makedirs(self._depth_dir,  exist_ok=True)
+
+        self.state          = State()
+        self._left_rc_modes = False
+        self._yaw           = 0.0
+        self._latest_bgr    = None   # used in sim mode only
+        self._frame_lock    = threading.Lock()
+        self._gst_proc      = None   # persistent GStreamer pipeline (real hardware)
+        self._best_focus    = INITIAL_FOCUS
+        self._step_count    = 0
 
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         state_qos = QoSProfile(
@@ -219,15 +278,20 @@ class FreeriderNode(Node):
         self.arm_client  = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.mode_client = self.create_client(SetMode,     '/mavros/set_mode')
         self.land_client = self.create_client(CommandTOL,  '/mavros/cmd/land')
-
-        self.vel_pub = self.create_publisher(
-            TwistStamped, '/mavros/setpoint_velocity/cmd_vel', 10
-        )
+        self.vel_pub     = self.create_publisher(TwistStamped, '/mavros/setpoint_velocity/cmd_vel', 10)
 
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self._depth = DepthEstimator(device=device)
         self._trt   = TRTEngine(engine_path)
         self.get_logger().info(f'[Freerider] Engine loaded: {engine_path}')
+
+        log_path         = os.path.join(flight_dir, 'flight.csv')
+        self._log_file   = open(log_path, 'w', newline='')
+        self._log_writer = csv.writer(self._log_file)
+        self._log_writer.writerow([
+            't', 'raw_action', 'smoothed_action',
+            'forward_vel', 'lateral_vel', 'step_latency_ms',
+        ])
 
     # ------------------------------------------------------------------
     # ROS callbacks
@@ -246,7 +310,6 @@ class FreeriderNode(Node):
         self._yaw = np.arctan2(siny_cosp, cosy_cosp)
 
     def _on_sim_image(self, msg):
-        """Receive a ROS Image from the simulator and store it as BGR."""
         try:
             bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             with self._frame_lock:
@@ -259,15 +322,13 @@ class FreeriderNode(Node):
     # ------------------------------------------------------------------
 
     def _rc_override(self) -> bool:
-        """Returns True once the pilot has switched to an RC mode after
-        having been in a non-RC mode (i.e. after OFFBOARD has been active)."""
         if self.state.mode not in RC_OVERRIDE_MODES:
             self._left_rc_modes = True
             return False
         return self._left_rc_modes
 
     # ------------------------------------------------------------------
-    # Velocity publishing (body-frame → ENU via yaw rotation)
+    # Velocity publishing
     # ------------------------------------------------------------------
 
     def _publish_vel(self, vx: float = 0.0, vy: float = 0.0, vz: float = 0.0):
@@ -279,6 +340,47 @@ class FreeriderNode(Node):
         msg.twist.linear.y  = vx * np.sin(yaw) + vy * np.cos(yaw)
         msg.twist.linear.z  = vz
         self.vel_pub.publish(msg)
+
+    # ------------------------------------------------------------------
+    # Camera
+    # ------------------------------------------------------------------
+
+    def _start_camera(self):
+        if self._sim:
+            self.get_logger().info('[Freerider] Sim mode — using ROS image topic.')
+            return
+        self.get_logger().info('[Freerider] Starting GStreamer camera pipeline...')
+        self._gst_proc = _start_gst_pipeline()
+        self.get_logger().info('[Freerider] Camera pipeline ready.')
+
+    def _get_frame(self) -> np.ndarray | None:
+        if self._sim:
+            with self._frame_lock:
+                return self._latest_bgr.copy() if self._latest_bgr is not None else None
+        return _latest_frame()
+
+    def _stop_camera(self):
+        if self._gst_proc is not None:
+            self._gst_proc.terminate()
+            self._gst_proc.wait()
+            self._gst_proc = None
+
+    # ------------------------------------------------------------------
+    # Autofocus (real hardware only) — two-pass: coarse then fine
+    # ------------------------------------------------------------------
+
+    def _run_autofocus(self) -> int:
+        self.get_logger().info('[autofocus] Coarse scan (0–1000, step 50)...')
+        coarse_best, _ = _focus_scan(0, 1000, COARSE_STEP, self._publish_vel)
+
+        fine_start = max(0,    coarse_best - FINE_RANGE)
+        fine_stop  = min(1000, coarse_best + FINE_RANGE)
+        self.get_logger().info(f'[autofocus] Fine scan ({fine_start}–{fine_stop}, step {FINE_STEP})...')
+        fine_best, fine_score = _focus_scan(fine_start, fine_stop, FINE_STEP, self._publish_vel)
+
+        set_focus(fine_best)
+        self.get_logger().info(f'[autofocus] Done — best={fine_best}  sharpness={fine_score:.1f}')
+        return fine_best
 
     # ------------------------------------------------------------------
     # Arm / takeoff / offboard / land
@@ -368,77 +470,29 @@ class FreeriderNode(Node):
                 return
 
     # ------------------------------------------------------------------
-    # Camera thread (GStreamer → raw BGR, + MP4 recording)
-    # ------------------------------------------------------------------
-
-    def _start_camera(self):
-        if self._sim:
-            self.get_logger().info('[Freerider] Sim mode — using ROS image topic, skipping GStreamer.')
-            return
-        threading.Thread(target=self._camera_reader, daemon=True).start()
-
-    def _camera_reader(self):
-        cap = cv2.VideoCapture(GST_PIPELINE, cv2.CAP_GSTREAMER)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            self.get_logger().error('Cannot open camera')
-            return
-
-        os.makedirs(VIDEO_DIR, exist_ok=True)
-        stamp  = time.strftime('%Y%m%d_%H%M%S')
-        fname  = os.path.join(VIDEO_DIR, f'{stamp}.mp4')
-        writer = cv2.VideoWriter(fname, cv2.VideoWriter_fourcc(*'mp4v'), 30, (1920, 1080))
-        self.get_logger().info(f'Recording to {fname}')
-        self._recording = True
-
-        while self._recording:
-            ret, frame = cap.read()
-            if ret:
-                writer.write(frame)
-                with self._frame_lock:
-                    self._latest_bgr = frame
-
-        writer.release()
-        cap.release()
-        self.get_logger().info('Recording saved.')
-        if not self._sim:
-            subprocess.Popen(
-                ['rclone', 'copy', VIDEO_DIR, 'dropbox:freerider/debug_frames'],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-
-    def _get_frame(self):
-        with self._frame_lock:
-            return self._latest_bgr.copy() if self._latest_bgr is not None else None
-
-    # ------------------------------------------------------------------
     # One policy step
     # ------------------------------------------------------------------
 
-    def _avoidance_step(self, frame_stack: deque, smoothed_action: float):
-        """Estimate depth, run TRT policy, publish velocity.
-
-        Returns (frame_stack, raw_action, new_smoothed_action, lateral_vel, step_latency_ms).
-        Returns unchanged smoothed_action, 0.0 lateral and 0.0 latency if no frame yet.
-        """
+    def _avoidance_step(self, frame_stack: deque, smoothed_action: float, t0: float):
         bgr = self._get_frame()
         if bgr is None:
-            return frame_stack, smoothed_action, smoothed_action, 0.0, 0.0
+            return frame_stack, smoothed_action, smoothed_action, 0.0, 0.0, 0.0
 
         t_step_start = time.monotonic()
 
-        depth = self._depth.estimate(bgr)   # (144, 256) float32 [0, 1]
-        frame_stack.append(depth)
+        # Re-apply best focus every step to counteract vibration drift
+        if not self._sim:
+            set_focus(self._best_focus)
 
-        # Pad with the oldest frame until the stack is full
+        depth = self._depth.estimate(bgr)
+        frame_stack.append(depth)
         while len(frame_stack) < N_FRAMES:
             frame_stack.appendleft(frame_stack[0])
 
-        image_np = np.stack(list(frame_stack), axis=0)         # (3, 144, 256)
-        state_np = np.array([smoothed_action], dtype=np.float32)  # (1,)
+        image_np = np.stack(list(frame_stack), axis=0)
+        state_np = np.array([smoothed_action], dtype=np.float32)
 
-        raw_action  = float(np.clip(self._trt.infer(image_np, state_np), -1.0, 1.0))
+        raw_action   = float(np.clip(self._trt.infer(image_np, state_np), -1.0, 1.0))
         new_smoothed = SMOOTH_ALPHA * raw_action + ACTION_MOMENTUM * smoothed_action
 
         fwd = FIXED_SPEED - MAX_LATERAL * abs(new_smoothed)
@@ -446,8 +500,24 @@ class FreeriderNode(Node):
         self._publish_vel(vx=fwd, vy=lat)
 
         step_latency_ms = (time.monotonic() - t_step_start) * 1000.0
+        t = time.monotonic() - t0
 
-        return frame_stack, raw_action, new_smoothed, lat, step_latency_ms
+        self._log_writer.writerow([
+            f'{t:.3f}', f'{raw_action:.4f}', f'{new_smoothed:.4f}',
+            f'{fwd:.4f}', f'{lat:.4f}', f'{step_latency_ms:.1f}',
+        ])
+        self._log_file.flush()
+
+        self._step_count += 1
+        stamp = f'{self._step_count:06d}'
+        if self._step_count % RGB_SAVE_EVERY == 0:
+            cv2.imwrite(os.path.join(self._frames_dir, f'{stamp}.jpg'), bgr)
+        cv2.imwrite(
+            os.path.join(self._depth_dir, f'{stamp}.jpg'),
+            (depth * 255).astype(np.uint8),
+        )
+
+        return frame_stack, raw_action, new_smoothed, fwd, lat, step_latency_ms
 
     # ------------------------------------------------------------------
     # Main run sequence
@@ -457,7 +527,6 @@ class FreeriderNode(Node):
         dt = 1.0 / SETPOINT_HZ
         self._left_rc_modes = False
 
-        # Wait briefly for MAVROS, then try to launch it if absent
         deadline = time.monotonic() + 2.0
         while not self.state.connected and time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
@@ -502,8 +571,10 @@ class FreeriderNode(Node):
         self.get_logger().info('Climbing...')
         while self.state.mode == 'AUTO.TAKEOFF':
             if self._rc_override():
+                self.get_logger().info('RC override during climb — aborting.')
                 return
             if not self.state.armed:
+                self.get_logger().error('Disarmed during climb (motors not spinning? PDB off?) — aborting.')
                 return
             rclpy.spin_once(self, timeout_sec=0.1)
 
@@ -515,20 +586,15 @@ class FreeriderNode(Node):
             self.get_logger().error('Failed to enter OFFBOARD — aborting.')
             return
 
-        # CSV log
-        os.makedirs(LOG_DIR, exist_ok=True)
-        stamp    = time.strftime('%Y%m%d_%H%M%S')
-        log_path = os.path.join(LOG_DIR, f'flight_{stamp}.csv')
-        log_file = open(log_path, 'w', newline='')
-        csv_writer = csv.writer(log_file)
-        csv_writer.writerow(['t', 'raw_action', 'smoothed_action', 'lateral_vel_ms', 'step_latency_ms'])
+        if not self._sim:
+            self._best_focus = self._run_autofocus()
+
+        latencies   = []
+        frame_stack = deque(maxlen=N_FRAMES)
+        smoothed    = 0.0
+        t0          = time.monotonic()
 
         self.get_logger().info('Freerider avoidance active. RC override to exit.')
-        frame_stack     = deque(maxlen=N_FRAMES)
-        smoothed_action = 0.0
-        t0              = time.monotonic()
-        latencies       = []
-
         try:
             while True:
                 rclpy.spin_once(self, timeout_sec=dt)
@@ -538,36 +604,82 @@ class FreeriderNode(Node):
                 if not self.state.armed:
                     self.get_logger().info('Disarmed — stopping.')
                     break
-                frame_stack, raw_action, smoothed_action, lat, latency_ms = self._avoidance_step(
-                    frame_stack, smoothed_action,
+                frame_stack, raw, smoothed, fwd, lat, latency_ms = self._avoidance_step(
+                    frame_stack, smoothed, t0,
                 )
                 if latency_ms > 0.0:
                     latencies.append(latency_ms)
-                csv_writer.writerow([
-                    f'{time.monotonic() - t0:.3f}',
-                    f'{raw_action:.4f}',
-                    f'{smoothed_action:.4f}',
-                    f'{lat:.4f}',
-                    f'{latency_ms:.1f}',
-                ])
         finally:
-            log_file.close()
+            self._log_file.close()
+            self._stop_camera()
             if latencies:
-                avg_ms = sum(latencies) / len(latencies)
                 self.get_logger().info(
-                    f'Step latency — avg: {avg_ms:.1f} ms  '
+                    f'Step latency — avg: {sum(latencies)/len(latencies):.1f} ms  '
                     f'min: {min(latencies):.1f} ms  '
                     f'max: {max(latencies):.1f} ms  '
                     f'({len(latencies)} steps)'
                 )
-            if not self._sim:
-                subprocess.Popen(
-                    ['rclone', 'copy', LOG_DIR, 'dropbox:freerider/logs'],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
 
         self._land()
-        self._recording = False
+
+
+# ---------------------------------------------------------------------------
+# Post-flight plot
+# ---------------------------------------------------------------------------
+
+def _plot_flight_log(flight_dir: str):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    csv_path = os.path.join(flight_dir, 'flight.csv')
+    if not os.path.exists(csv_path):
+        return
+
+    t, raw, smoothed, fwd, lat, latency = [], [], [], [], [], []
+    with open(csv_path) as f:
+        for row in csv.DictReader(f):
+            t.append(float(row['t']))
+            raw.append(float(row['raw_action']))
+            smoothed.append(float(row['smoothed_action']))
+            fwd.append(float(row['forward_vel']))
+            lat.append(float(row['lateral_vel']))
+            latency.append(float(row['step_latency_ms']))
+
+    if not t:
+        return
+
+    fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+    fig.suptitle(os.path.basename(flight_dir))
+
+    axes[0].plot(t, raw,      color='steelblue', label='raw action')
+    axes[0].axhline(0, color='gray', linewidth=0.5)
+    axes[0].set_ylabel('Raw action')
+    axes[0].set_ylim(-1.1, 1.1)
+    axes[0].legend()
+
+    axes[1].plot(t, smoothed, color='orange', label='smoothed action')
+    axes[1].axhline(0, color='gray', linewidth=0.5)
+    axes[1].set_ylabel('Smoothed action')
+    axes[1].set_ylim(-1.1, 1.1)
+    axes[1].legend()
+
+    axes[2].plot(t, fwd, color='green', label='forward (m/s)')
+    axes[2].plot(t, lat, color='red',   label='lateral (m/s)')
+    axes[2].axhline(0, color='gray', linewidth=0.5)
+    axes[2].set_ylabel('Velocity (m/s)')
+    axes[2].legend()
+
+    axes[3].plot(t, latency, color='purple', label='step latency (ms)')
+    axes[3].set_ylabel('Latency (ms)')
+    axes[3].set_xlabel('Time (s)')
+    axes[3].legend()
+
+    plt.tight_layout()
+    out = os.path.join(flight_dir, 'flight.png')
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f'[plot] saved → {out}')
 
 
 # ---------------------------------------------------------------------------
@@ -581,40 +693,44 @@ def main():
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model', 'freerider_actor.trt'),
         help='Path to TensorRT engine (.trt)',
     )
-    parser.add_argument(
-        '--sim',
-        action='store_true',
-        help='Simulation mode: connect via UDP, skip keypress, use ROS image topic for camera.',
-    )
-    parser.add_argument(
-        '--sim-image-topic',
-        default=SIM_IMAGE_TOPIC,
-        help=f'ROS image topic to use in sim mode (default: {SIM_IMAGE_TOPIC})',
-    )
+    parser.add_argument('--sim', action='store_true',
+                        help='Sim mode: connect via UDP, skip keypress, use ROS image topic.')
+    parser.add_argument('--sim-image-topic', default=SIM_IMAGE_TOPIC,
+                        help=f'ROS image topic in sim mode (default: {SIM_IMAGE_TOPIC})')
     args = parser.parse_args()
+
+    stamp      = time.strftime('%Y-%m-%d_%H-%M-%S')
+    flight_dir = os.path.join(FLIGHT_LOG_ROOT, stamp)
+    os.makedirs(flight_dir, exist_ok=True)
 
     print('=' * 60)
     print('Freerider — PPO Obstacle Avoidance')
-    print(f'Engine : {args.engine}')
+    print(f'Engine     : {args.engine}')
+    print(f'Flight log : {flight_dir}')
     if args.sim:
-        print(f'Mode   : Simulation (PX4 SITL via {SIM_FCU_URL})')
-        print(f'Camera : {args.sim_image_topic}')
+        print(f'Mode       : Simulation (PX4 SITL via {SIM_FCU_URL})')
+        print(f'Camera     : {args.sim_image_topic}')
     else:
-        print('Mode   : Real hardware')
+        print('Mode       : Real hardware')
+        print('Autofocus  : two-pass coarse+fine on hover after takeoff')
         print('RC override: switch to ALTCTL or POSCTL at any time')
     print('=' * 60)
 
     rclpy.init()
-    node = FreeriderNode(args.engine, sim=args.sim, sim_image_topic=args.sim_image_topic)
+    node = FreeriderNode(args.engine, flight_dir, sim=args.sim,
+                         sim_image_topic=args.sim_image_topic)
     try:
         node.run()
     except KeyboardInterrupt:
         node.get_logger().info('Interrupted.')
     finally:
-        node._recording = False
+        if not node._log_file.closed:
+            node._log_file.close()
+        node._stop_camera()
         time.sleep(0.5)
         node.destroy_node()
         rclpy.shutdown()
+        _plot_flight_log(flight_dir)
 
 
 if __name__ == '__main__':
