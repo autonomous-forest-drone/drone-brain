@@ -56,7 +56,7 @@ def set_focus(value):
     raw = (value << 4) & 0x3FF0
     data1 = (raw >> 8) & 0x3F
     data2 = raw & 0xF0
-    os.system(f"sudo i2cset -y {I2C_BUS} 0x{VCM_ADDR:02X} {data1} {data2}")
+    os.system(f"i2cset -y {I2C_BUS} 0x{VCM_ADDR:02X} {data1} {data2}")
 
 
 # -------- FRAME CAPTURE --------
