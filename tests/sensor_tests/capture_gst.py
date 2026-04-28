@@ -41,10 +41,10 @@ def start_pipeline():
         f"gst-launch-1.0 nvarguscamerasrc ! "
         f"'video/x-raw(memory:NVMM),width={CAPTURE_WIDTH},height={CAPTURE_HEIGHT},"
         f"framerate=30/1' ! nvvidconv ! jpegenc ! "
-        f"multifilesink location={FRAME_DIR}/frame_%05d.jpg max-files=5"
+        f'multifilesink location="{FRAME_DIR}/frame_%05d.jpg" max-files=5'
     )
     proc = subprocess.Popen(cmd, shell=True,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            stdout=subprocess.DEVNULL, stderr=None)
     time.sleep(2.5)  # wait for Argus session to initialize
     return proc
 
