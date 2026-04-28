@@ -19,7 +19,7 @@ Flow:
 RC override: switching to ALTCTL or POSCTL at any time exits the loop.
 
 Usage:
-    python run_freerider.py --engine ~/freerider/models/freerider_actor.trt
+    python run_freerider.py --engine ~/freerider/model/freerider_actor.trt
 
 Requirements (Jetson):
     pip install transformers torch torchvision pillow pycuda
@@ -578,7 +578,7 @@ def main():
     parser = argparse.ArgumentParser(description='Freerider PPO avoidance flight')
     parser.add_argument(
         '--engine',
-        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'freerider_actor.trt'),
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model', 'freerider_actor.trt'),
         help='Path to TensorRT engine (.trt)',
     )
     parser.add_argument(
