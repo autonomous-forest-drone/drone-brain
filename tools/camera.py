@@ -7,10 +7,26 @@ autofocus() functions.
 
 Requires root (sudo) to run — i2cset needs elevated privileges.
 
+Rolling shutter note
+--------------------
+The IMX477 is a rolling-shutter sensor: rows are exposed sequentially from
+top to bottom, so a fast-moving subject (or drone) causes each row to capture
+a slightly different instant, producing horizontal skew or "jello".
+
+The most effective software mitigation is a very short, fixed shutter speed:
+the narrower the exposure window, the less time elapses between the first and
+last row, making the artifact negligible at typical drone speeds.
+
+Pass ``exposure_ns`` (nanoseconds) to lock shutter speed.  Common values:
+    500_000   →  1/2000 s   good for fast drone motion
+    1_000_000 →  1/1000 s   good default for moderate motion
+    2_000_000 →  1/500 s    slow/hover
+    None                    ISP auto-exposure (not recommended in flight)
+
 Usage:
     from tools.camera import Camera
 
-    with Camera() as cam:
+    with Camera(exposure_ns=500_000) as cam:
         cam.set_focus(400)
         frame = cam.capture()          # returns BGR numpy array
 
@@ -55,9 +71,24 @@ class Camera:
     def __init__(self,
                  width: int = CAPTURE_WIDTH,
                  height: int = CAPTURE_HEIGHT,
+                 exposure_ns: int | None = None,
                  verbose: bool = False):
+        """
+        Parameters
+        ----------
+        width, height : int
+            Capture resolution.
+        exposure_ns : int | None
+            Fixed shutter speed in nanoseconds.  When set, auto-exposure is
+            disabled and the ISP uses this exact exposure time for every frame.
+            Use short values (e.g. 500_000 = 1/2000 s) to minimise rolling-
+            shutter artefacts during drone flight.  None = auto-exposure.
+        verbose : bool
+            Forward GStreamer stderr to the terminal.
+        """
         self.width = width
         self.height = height
+        self.exposure_ns = exposure_ns
         self.verbose = verbose
         self._proc = None
 
@@ -98,8 +129,20 @@ class Camera:
         for f in glob.glob(f"{FRAME_DIR}/frame_*.jpg"):
             os.remove(f)
 
+        # Build optional exposure lock string.
+        # aelock=true + a tight exposuretimerange pins the shutter speed,
+        # which minimises rolling-shutter artefacts when the drone is moving.
+        if self.exposure_ns is not None:
+            exp_ns = int(self.exposure_ns)
+            exposure_args = (
+                f"aelock=true "
+                f"exposuretimerange=\"{exp_ns} {exp_ns}\""
+            )
+        else:
+            exposure_args = ""
+
         cmd = (
-            f"gst-launch-1.0 nvarguscamerasrc ! "
+            f"gst-launch-1.0 nvarguscamerasrc {exposure_args} ! "
             f"'video/x-raw(memory:NVMM),width={self.width},height={self.height},"
             f"framerate=30/1' ! nvvidconv ! jpegenc ! "
             f'multifilesink location="{FRAME_DIR}/frame_%05d.jpg" max-files=5'
