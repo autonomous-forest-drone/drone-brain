@@ -1,4 +1,4 @@
-ELINA/
 debug_frames/
 images/
-PX4-Autopilot/
+model/
+*.zip
