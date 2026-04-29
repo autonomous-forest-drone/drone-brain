@@ -7,61 +7,30 @@ import time
 
 import numpy as np
 import cv2
-import torch
-import torch.nn.functional as F
 
-DEBUG_DIR  = '/home/beetlesniffer/PythonProjects/DANI/debug_frames'
-MIDAS_PATH = '/home/beetlesniffer/.cache/torch/hub/intel-isl_MiDaS_master'
+import pycuda.autoinit  # noqa: F401  — must come before TRT engine load
 
+from jetson_camera import DEFAULT_FOCUS, GstJpegCapture, set_focus
+from midas_trt import TRTMidas
 
-def load_midas():
-    if MIDAS_PATH not in sys.path:
-        sys.path.insert(0, MIDAS_PATH)
+DEBUG_DIR = '/home/beetlesniffer/drone-brain/models/fortune_cookie/images'
+MIDAS_TRT = '/home/beetlesniffer/drone-brain/models/fortune_cookie/model/midas_small.trt'
 
-    from midas.midas_net_custom import MidasNet_small
-    from midas.transforms import Resize, NormalizeImage, PrepareForNet
-
-    model = MidasNet_small(
-        None, features=64, backbone='efficientnet_lite3',
-        exportable=True, non_negative=True, blocks={'expand': True}
-    )
-    weights_path = '/home/beetlesniffer/.cache/torch/hub/checkpoints/midas_v21_small_256.pt'
-    state_dict = torch.load(weights_path, map_location='cpu', weights_only=False)
-    model.load_state_dict(state_dict)
-    model.eval().cuda()
-
-    def transform(img):
-        sample = {"image": img / 255.0}
-        sample = Resize(256, 256, resize_target=None, keep_aspect_ratio=True,
-                        ensure_multiple_of=32, resize_method="upper_bound",
-                        image_interpolation_method=cv2.INTER_CUBIC)(sample)
-        sample = NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(sample)
-        sample = PrepareForNet()(sample)
-        return torch.from_numpy(sample["image"]).unsqueeze(0)
-
-    return model, transform
+CAM_W, CAM_H, CAM_FPS = 1920, 1080, 30   # full res for the viewer
+VIEWER_FOCUS = 550   # tuned for the viewer's typical scene; override per-run if needed
 
 
-def open_camera():
-    gst_pipeline = (
-        'nvarguscamerasrc ! '
-        'video/x-raw(memory:NVMM), width=1920, height=1080, framerate=30/1 ! '
-        'nvvidconv ! video/x-raw, format=BGRx ! '
-        'videoconvert ! video/x-raw, format=BGR ! appsink'
-    )
-    cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
-    if not cap.isOpened():
-        print('GStreamer failed, falling back to v4l2...')
-        cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print('ERROR: cannot open camera')
-        return None
+def open_camera(focus=VIEWER_FOCUS):
+    cap = GstJpegCapture(CAM_W, CAM_H, CAM_FPS)
+    set_focus(focus)
+    time.sleep(0.3)   # VCM lens travel
+    print(f'Camera streaming {CAM_W}x{CAM_H}@{CAM_FPS}  |  focus locked at {focus}')
     return cap
 
 
 def sync_dropbox():
     subprocess.Popen(
-        ['rclone', 'copy', DEBUG_DIR, 'dropbox:DANI/debug_frames'],
+        ['rclone', 'copy', DEBUG_DIR, 'dropbox:fortune_cookie/images'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
@@ -80,12 +49,14 @@ def main():
 
     os.makedirs(DEBUG_DIR, exist_ok=True)
 
-    midas, transform = None, None
+    midas = None
     if choice == '3':
-        torch.zeros(1).cuda()
-        torch.backends.cudnn.enabled = False
-        print('Loading MiDaS...')
-        midas, transform = load_midas()
+        if not os.path.exists(MIDAS_TRT):
+            print(f'ERROR: MiDaS TRT engine not found at {MIDAS_TRT}')
+            print('       Build it with: python3 models/fortune_cookie/helpers/export_midas_trt.py')
+            return
+        print('Loading MiDaS TRT engine...')
+        midas = TRTMidas(MIDAS_TRT)
         print('MiDaS ready.')
 
     cap = open_camera()
@@ -118,17 +89,11 @@ def main():
             cv2.imwrite(fname, rgb192)
 
         elif choice == '3':
-            rgb = frame[:, :, ::-1].copy()
-            rgb = cv2.resize(rgb, (192, 192), interpolation=cv2.INTER_AREA)
-            inp = transform(rgb).cuda()
-            with torch.no_grad():
-                pred = midas(inp)
-            if pred.dim() == 3:
-                pred = pred.unsqueeze(1)
-            pred  = F.interpolate(pred, (192, 192), mode='bilinear', align_corners=False).squeeze(1)
-            mn, mx = pred.min(), pred.max()
-            depth = ((pred - mn) / (mx - mn + 1e-8)).cpu().numpy().astype(np.float32)
-            cv2.imwrite(fname, (depth[0] * 255).astype(np.uint8))
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            depth = midas.infer(rgb)[0]   # (H, W) float32 in [0, 1]
+            depth_u8 = (depth * 255).astype(np.uint8)
+            depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_INFERNO)
+            cv2.imwrite(fname, depth_color)
 
         print(f'Saved {fname}')
         sync_dropbox()

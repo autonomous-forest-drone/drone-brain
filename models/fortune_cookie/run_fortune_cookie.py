@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import csv
 import os
 import select
@@ -9,11 +10,10 @@ import termios
 import threading
 import time
 import tty
+from collections import deque
 
 import numpy as np
 import cv2
-import torch
-import torch.nn.functional as F
 import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit  # noqa: F401
@@ -26,16 +26,27 @@ from nav_msgs.msg import Odometry
 from mavros_msgs.msg import State, StatusText
 from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
 
-ENGINE_PATH    = '/home/beetlesniffer/PythonProjects/DANI/models/avoidance_policy.trt'
+# Shared camera + focus + MiDaS-TRT helpers — see tools/{jetson_camera,midas_trt}.py
+sys.path.insert(0, '/home/beetlesniffer/drone-brain/tools')
+from jetson_camera import DEFAULT_FOCUS, GstJpegCapture, set_focus
+from midas_trt import TRTMidas
+
+ENGINE_PATH    = '/home/beetlesniffer/drone-brain/models/fortune_cookie/model/jetson_converted_model.trt'
+MIDAS_TRT      = '/home/beetlesniffer/drone-brain/models/fortune_cookie/model/midas_small.trt'
 SETPOINT_HZ    = 10
 PRESTREAM_TIME = 2.0
 
-GST_PIPELINE = (
-    'nvarguscamerasrc ! '
-    'video/x-raw(memory:NVMM), width=1920, height=1080, framerate=30/1 ! '
-    'nvvidconv ! video/x-raw, format=BGRx ! '
-    'videoconvert ! video/x-raw, format=BGR ! appsink'
-)
+# Camera + depth pipeline — must match timing_test_midas.py and the policy's
+# training-time obs shape: (B, 3, 126, 224), 3 stacked depth frames at 126x224
+# spanning 1 s of motion at 10 Hz (idxs [-11, -6, -1] over an 11-frame deque).
+CAM_W, CAM_H, CAM_FPS = 640, 480, 30
+MIDAS_INPUT    = 256
+DEPTH_H        = 126
+DEPTH_W        = 224
+DEPTH_STACK_N  = 3
+DEPTH_STRIDE   = 5
+DEPTH_BUFFER_N = (DEPTH_STACK_N - 1) * DEPTH_STRIDE + 1   # 11
+STACK_IDXS     = [-1 - i * DEPTH_STRIDE for i in range(DEPTH_STACK_N)][::-1]   # [-11, -6, -1]
 
 RC_OVERRIDE_MODES = {'ALTCTL', 'POSCTL'}
 _CMD_INTERVAL     = 2.0
@@ -52,16 +63,20 @@ def load_engine(path: str) -> trt.ICudaEngine:
 
 
 class AvoidanceNode(Node):
-    def __init__(self):
+    def __init__(self, focus=DEFAULT_FOCUS):
         super().__init__('avoidance_node')
 
-        torch.backends.cudnn.enabled = False
+        self.focus = focus
+        self.cap   = None     # opened in _init_camera() before takeoff
+
         self._init_trt()
-        self._init_midas()
-        self.latest_rgb     = None
-        self.latest_depth   = None
-        self.delayed_action = 0.0
-        self.prev_action    = 0.0
+        self.midas = TRTMidas(MIDAS_TRT)
+        self.latest_rgb       = None
+        self.latest_depth_2d  = None       # most recent (DEPTH_H, DEPTH_W) for debug
+        self.latest_obs       = None       # (3, DEPTH_H, DEPTH_W) — fed to policy
+        self.depth_buffer     = deque(maxlen=DEPTH_BUFFER_N)
+        self.delayed_action   = 0.0
+        self.prev_action      = 0.0
 
         self.state           = State()
         self._left_rc_modes  = False
@@ -86,10 +101,9 @@ class AvoidanceNode(Node):
 
         self.vel_pub = self.create_publisher(TwistStamped, '/mavros/setpoint_velocity/cmd_vel', 10)
 
-        self._debug_dir  = '/home/beetlesniffer/PythonProjects/DANI/debug_frames'
-        self._flight_dir = os.path.join(self._debug_dir, f'flight_{time.strftime("%Y%m%d_%H%M%S")}')
+        self._debug_dir  = '/home/beetlesniffer/drone-brain/images'
+        self._flight_dir = os.path.join(self._debug_dir, f'flight_fortune_cookie{time.strftime("%Y%m%d_%H%M%S")}')
         os.makedirs(self._flight_dir, exist_ok=True)
-        self._recording  = False
         self._flight_t0  = None
         threading.Thread(target=self._debug_image_saver, daemon=True).start()
         self._log_path   = os.path.join(self._flight_dir, 'flight.csv')
@@ -114,102 +128,47 @@ class AvoidanceNode(Node):
             h_buf = cuda.pagelocked_empty(int(trt.volume(shape)), dtype=dtype)
             d_buf = cuda.mem_alloc(h_buf.nbytes)
             self._bufs[name] = {'h': h_buf, 'd': d_buf, 'mode': mode}
+            # Log shapes so a drift between engine and obs shape surfaces immediately
+            # (cryptic np.copyto length errors otherwise).
+            self.get_logger().info(f"[trt] {mode.name.lower()} '{name}' shape={tuple(shape)} dtype={dtype.__name__}")
 
         self.get_logger().info(f'TRT engine loaded: {ENGINE_PATH}')
-
-    def _init_midas(self):
-        import sys
-        MIDAS_PATH = '/home/beetlesniffer/.cache/torch/hub/intel-isl_MiDaS_master'
-        if MIDAS_PATH not in sys.path:
-            sys.path.insert(0, MIDAS_PATH)
-
-        self.get_logger().info('Loading MiDaS_small...')
-        from midas.midas_net_custom import MidasNet_small
-        from midas.transforms import Resize, NormalizeImage, PrepareForNet
-
-        self.midas = MidasNet_small(
-            None, features=64, backbone='efficientnet_lite3',
-            exportable=True, non_negative=True, blocks={'expand': True}
-        )
-        weights_path = '/home/beetlesniffer/.cache/torch/hub/checkpoints/midas_v21_small_256.pt'
-        state_dict = torch.load(weights_path, map_location='cpu', weights_only=False)
-        self.midas.load_state_dict(state_dict)
-        self.midas.eval().cuda()
-
-        self.midas_transform = self._make_small_transform(Resize, NormalizeImage, PrepareForNet)
-        self.get_logger().info('MiDaS ready.')
-
-    @staticmethod
-    def _make_small_transform(Resize, NormalizeImage, PrepareForNet):
-        import cv2
-        def transform(img):
-            sample = {"image": img / 255.0}
-            sample = Resize(256, 256, resize_target=None, keep_aspect_ratio=True,
-                            ensure_multiple_of=32, resize_method="upper_bound",
-                            image_interpolation_method=cv2.INTER_CUBIC)(sample)
-            sample = NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(sample)
-            sample = PrepareForNet()(sample)
-            return torch.from_numpy(sample["image"]).unsqueeze(0)
-        return transform
 
     def _debug_image_saver(self):
         while True:
             time.sleep(1.0)
-            if self.latest_depth is None:
+            if self.latest_depth_2d is None:
                 continue
             fname = os.path.join(self._flight_dir, f'{time.strftime("%H%M%S")}.jpg')
-            cv2.imwrite(fname, (self.latest_depth[0] * 255).astype(np.uint8))
-
-    def _start_recording(self):
-        self._recording = True
-        threading.Thread(target=self._record_video, daemon=True).start()
-
-    def _record_video(self):
-        cap = cv2.VideoCapture(GST_PIPELINE, cv2.CAP_GSTREAMER)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            self.get_logger().error('Cannot open camera for recording')
-            return
-        fname = os.path.join(self._debug_dir, f'{time.strftime("%H%M%S")}.mp4')
-        writer = cv2.VideoWriter(fname, cv2.VideoWriter_fourcc(*'mp4v'), 30, (1920, 1080))
-        self.get_logger().info(f'Recording to {fname}')
-        while self._recording:
-            ret, frame = cap.read()
-            if ret:
-                writer.write(frame)
-        writer.release()
-        cap.release()
-        self.get_logger().info('Recording saved.')
-        subprocess.Popen(
-            ['rclone', 'copy', self._debug_dir, 'dropbox:DANI/debug_frames'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+            cv2.imwrite(fname, (self.latest_depth_2d * 255).astype(np.uint8))
 
     # --------------------------------------------------------------- callbacks
 
     def _camera_reader(self):
-        cap = None
-        while cap is None or not cap.isOpened():
-            cap = cv2.VideoCapture(GST_PIPELINE, cv2.CAP_GSTREAMER)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
-                self.get_logger().warn('Camera not available — retrying in 1s...')
-                time.sleep(1.0)
-        self.get_logger().info('Camera opened.')
+        if self.cap is None or not self.cap.isOpened():
+            self.get_logger().error('Camera not opened — _init_camera must be called first.')
+            return
 
-        last_depth    = 0.0
-        depth_period  = 1.0 / SETPOINT_HZ
+        last_depth   = 0.0
+        depth_period = 1.0 / SETPOINT_HZ
         while True:
-            ret, frame = cap.read()
+            ret, frame = self.cap.read()
             if not ret:
                 continue
-            rgb = frame[:, :, ::-1].copy()
-            self.latest_rgb = cv2.resize(rgb, (192, 192), interpolation=cv2.INTER_AREA)
+            # resize to MiDaS input then BGR→RGB on the small image (cheaper)
+            small = cv2.resize(frame, (MIDAS_INPUT, MIDAS_INPUT), interpolation=cv2.INTER_LINEAR)
+            self.latest_rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
             now = time.monotonic()
             if now - last_depth >= depth_period:
-                self.latest_depth = self._depth_from_rgb(self.latest_rgb.copy())
+                d2 = self.midas.infer(self.latest_rgb, out_size=(DEPTH_H, DEPTH_W))[0]   # (DEPTH_H, DEPTH_W)
+                self.latest_depth_2d = d2
+                # pre-fill the buffer the first time so stacking works immediately
+                if not self.depth_buffer:
+                    for _ in range(DEPTH_BUFFER_N):
+                        self.depth_buffer.append(d2)
+                else:
+                    self.depth_buffer.append(d2)
+                self.latest_obs = np.stack([self.depth_buffer[i] for i in STACK_IDXS], axis=0)
                 last_depth = now
 
     def _on_state(self, msg: State):
@@ -248,24 +207,11 @@ class AvoidanceNode(Node):
 
     # --------------------------------------------------------------- inference
 
-    def _depth_from_rgb(self, rgb: np.ndarray) -> np.ndarray:
-        inp  = self.midas_transform(rgb).cuda()  # transform returns CPU tensor, move to GPU
-        with torch.no_grad():
-            pred = self.midas(inp)
-        if pred.dim() == 3:
-            pred = pred.unsqueeze(1)
-        pred  = F.interpolate(pred, (192, 192), mode='bilinear', align_corners=False)
-        pred  = pred.squeeze(1)
-        mn, mx = pred.min(), pred.max()
-        depth = (pred - mn) / (mx - mn + 1e-8)
-        arr = depth.cpu().numpy().astype(np.float32)
-        self.get_logger().info(f'depth min={arr.min():.3f} max={arr.max():.3f} mean={arr.mean():.3f}')
-        return arr
-
-    def _policy_infer(self, depth: np.ndarray) -> float:
+    def _policy_infer(self, obs_stack: np.ndarray) -> float:
+        """obs_stack shape: (DEPTH_STACK_N, DEPTH_H, DEPTH_W) → batch to (1, ...)."""
         self._cuda_ctx.push()
         try:
-            obs = depth[np.newaxis]
+            obs = obs_stack[np.newaxis].astype(np.float32, copy=False)
             for name, buf in self._bufs.items():
                 if buf['mode'] == trt.TensorIOMode.INPUT:
                     np.copyto(buf['h'], obs.ravel())
@@ -289,7 +235,7 @@ class AvoidanceNode(Node):
     # --------------------------------------------------------------- avoidance step
 
     def _avoidance_step(self):
-        if self.latest_rgb is None:
+        if self.latest_obs is None:
             self._publish_vel()
             return
 
@@ -298,7 +244,7 @@ class AvoidanceNode(Node):
         if self._cruise_alt is None and self._alt is not None:
             self._cruise_alt = self._alt
 
-        new_action = self._policy_infer(self.latest_depth)
+        new_action = self._policy_infer(self.latest_obs)
 
         smoothed         = 0.7 * new_action + 0.3 * self.prev_action
         self.prev_action = smoothed
@@ -400,6 +346,19 @@ class AvoidanceNode(Node):
         future = self.mode_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
 
+    # --------------------------------------------------------------- camera
+
+    def _init_camera(self):
+        """Open the CSI camera and lock focus. Must run before _camera_reader.
+        VCM only accepts I2C writes while Argus is streaming, so the focus-set
+        comes after the pipeline is up."""
+        self.cap = GstJpegCapture(CAM_W, CAM_H, CAM_FPS)
+        set_focus(self.focus)
+        time.sleep(0.3)   # VCM lens travel
+        self.get_logger().info(
+            f'Camera streaming {CAM_W}x{CAM_H}@{CAM_FPS} fps  |  focus locked at {self.focus}'
+        )
+
     # --------------------------------------------------------------- mission
 
     def run(self):
@@ -421,6 +380,18 @@ class AvoidanceNode(Node):
         while not self.state.connected:
             rclpy.spin_once(self, timeout_sec=0.1)
 
+        # Bring the camera up before the operator commits to arm — gives them
+        # a chance to bail if the focus or pipeline is bad, and pre-warms the
+        # depth ring buffer so the policy has a full obs by the time we hit OFFBOARD.
+        self._init_camera()
+        threading.Thread(target=self._camera_reader, daemon=True).start()
+
+        print('=' * 60)
+        print(f'  Camera   : streaming {CAM_W}x{CAM_H} @ {CAM_FPS} fps')
+        print(f'  Focus    : {self.focus} (locked, override with --focus N)')
+        print(f'  Engine   : {os.path.basename(ENGINE_PATH)}')
+        print(f'  Obs shape: (1, {DEPTH_STACK_N}, {DEPTH_H}, {DEPTH_W})')
+        print('=' * 60)
         self.get_logger().info('Connected. Press any key to arm and take off.')
 
         fd = sys.stdin.fileno()
@@ -454,8 +425,6 @@ class AvoidanceNode(Node):
             rclpy.spin_once(self, timeout_sec=0.1)
 
         self.get_logger().info(f'Takeoff complete (now in {self.state.mode}).')
-        threading.Thread(target=self._camera_reader, daemon=True).start()
-        # self._start_recording()
 
         result = self._switch_offboard()
         if result is None:
@@ -533,7 +502,7 @@ def _sync_dropbox(debug_dir):
     print('Syncing to Dropbox...')
     try:
         subprocess.run(
-            ['rclone', 'copy', debug_dir, 'dropbox:DANI/debug_frames'],
+            ['rclone', 'copy', debug_dir, 'dropbox:fortune_cookie/images'],
             timeout=120,
         )
         print('Dropbox sync complete.')
@@ -544,19 +513,27 @@ def _sync_dropbox(debug_dir):
 
 
 def main():
-    print('=' * 50)
+    parser = argparse.ArgumentParser(
+        description='Avoidance policy: arm → takeoff 1.5 m → OFFBOARD → run until RC override.'
+    )
+    parser.add_argument('--focus', type=int, default=DEFAULT_FOCUS,
+                        help=f'VCM focus value 0-1000 (default {DEFAULT_FOCUS}).')
+    args = parser.parse_args()
+
+    print('=' * 60)
     print('Avoidance policy — arm → takeoff 1.5 m → OFFBOARD → run until RC override')
     print('RC override : switch to ALTCTL or POSCTL at any time')
-    print('=' * 50)
+    print('=' * 60)
 
     rclpy.init()
-    node = AvoidanceNode()
+    node = AvoidanceNode(focus=args.focus)
     try:
         node.run()
     except KeyboardInterrupt:
         node.get_logger().info('Interrupted.')
     finally:
-        node._recording = False
+        if node.cap is not None:
+            node.cap.release()
         node._log_file.close()
         _plot_flight_log(node._log_path)
         _sync_dropbox(node._debug_dir)

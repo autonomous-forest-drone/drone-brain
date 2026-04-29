@@ -3,3 +3,4 @@ flight_logs/
 images/
 model/
 *.zip
+__pycache__

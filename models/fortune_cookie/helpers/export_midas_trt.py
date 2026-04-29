@@ -17,7 +17,7 @@ import torch
 
 MIDAS_REPO    = "/home/beetlesniffer/.cache/torch/hub/intel-isl_MiDaS_master"
 MIDAS_WEIGHTS = "/home/beetlesniffer/.cache/torch/hub/checkpoints/midas_v21_small_256.pt"
-OUT_DIR       = "/home/beetlesniffer/PythonProjects/DANI/models"
+OUT_DIR       = "/home/beetlesniffer/drone-brain/models/fortune_cookie/model"
 ONNX_PATH     = os.path.join(OUT_DIR, "midas_small.onnx")
 TRT_PATH      = os.path.join(OUT_DIR, "midas_small.trt")
 INPUT_SIZE    = 256   # MiDaS_small was trained at 256
@@ -56,7 +56,7 @@ def build_trt():
         return
 
     cmd = [
-        "trtexec",
+        "/usr/src/tensorrt/bin/trtexec",
         f"--onnx={ONNX_PATH}",
         f"--saveEngine={TRT_PATH}",
         "--fp16",

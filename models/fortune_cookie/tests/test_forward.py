@@ -11,6 +11,11 @@ import tty
 
 import cv2
 import numpy as np
+
+# Shared camera helper — see tools/jetson_camera.py
+sys.path.insert(0, '/home/beetlesniffer/drone-brain/tools')
+from jetson_camera import GstJpegCapture
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
@@ -21,13 +26,8 @@ from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
 
 SETPOINT_HZ    = 10
 PRESTREAM_TIME = 2.0
-VIDEO_DIR      = '/home/beetlesniffer/PythonProjects/DANI/debug_frames'
-GST_PIPELINE   = (
-    'nvarguscamerasrc ! '
-    'video/x-raw(memory:NVMM), width=1920, height=1080, framerate=30/1 ! '
-    'nvvidconv ! video/x-raw, format=BGRx ! '
-    'videoconvert ! video/x-raw, format=BGR ! appsink'
-)
+VIDEO_DIR              = '/home/beetlesniffer/drone-brain/models/fortune_cookie/images'
+REC_W, REC_H, REC_FPS  = 1920, 1080, 30
 _CMD_INTERVAL  = 2.0
 _ARM_TIMEOUT   = 30.0
 _TAKEOFF_TIMEOUT  = 30.0
@@ -178,16 +178,15 @@ class TestForwardNode(Node):
         threading.Thread(target=self._record_video, daemon=True).start()
 
     def _record_video(self):
-        cap = cv2.VideoCapture(GST_PIPELINE, cv2.CAP_GSTREAMER)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            self.get_logger().error('Cannot open camera for recording')
+        try:
+            cap = GstJpegCapture(REC_W, REC_H, REC_FPS)
+        except RuntimeError as e:
+            self.get_logger().error(f'Cannot open camera for recording: {e}')
             return
 
         fname = os.path.join(VIDEO_DIR, f'{time.strftime("%H%M%S")}.mp4')
-        writer = cv2.VideoWriter(fname, cv2.VideoWriter_fourcc(*'mp4v'), 30, (1920, 1080))
-        self.get_logger().info(f'Recording to {fname}')
+        writer = cv2.VideoWriter(fname, cv2.VideoWriter_fourcc(*'mp4v'), REC_FPS, (REC_W, REC_H))
+        self.get_logger().info(f'Recording to {fname}  ({REC_W}x{REC_H} @ {REC_FPS} fps)')
 
         while self._recording:
             ret, frame = cap.read()
@@ -198,7 +197,7 @@ class TestForwardNode(Node):
         cap.release()
         self.get_logger().info('Recording saved.')
         subprocess.Popen(
-            ['rclone', 'copy', VIDEO_DIR, 'dropbox:DANI/debug_frames'],
+            ['rclone', 'copy', VIDEO_DIR, 'dropbox:fortune_cookie/images'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
