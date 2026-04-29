@@ -66,7 +66,7 @@ from tools.camera import Camera
 # ---------------------------------------------------------------------------
 SETPOINT_HZ     = 10
 PRESTREAM_TIME  = 2.0
-FLIGHT_LOG_ROOT = os.path.expanduser('~/drone-brain/flight_logs')
+FLIGHT_LOG_ROOT = os.path.expanduser('~/drone-brain/images')
 DEPTH_MODEL_ID  = 'depth-anything/Depth-Anything-V2-Small-hf'
 IMG_H, IMG_W    = 144, 256
 N_FRAMES        = 3
@@ -609,7 +609,7 @@ def _plot_flight_log(flight_dir: str):
 # ---------------------------------------------------------------------------
 
 def _sync_dropbox(flight_dir: str, stamp: str):
-    dest = f'dropbox:drone-brain/flight_freerider_{stamp}'
+    dest = f'dropbox:images/flight_freerider_{stamp}'
     print(f'[dropbox] Syncing to {dest} ...')
     try:
         subprocess.run(
