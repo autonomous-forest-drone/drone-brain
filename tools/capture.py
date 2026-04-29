@@ -55,9 +55,21 @@ def parse_args():
         metavar="NS",
         help=(
             "Fixed shutter speed in nanoseconds. "
-            "Recommended during flight to reduce rolling-shutter artefacts. "
             "E.g. 500000 = 1/2000 s, 1000000 = 1/1000 s. "
             "Omit for ISP auto-exposure."
+        ),
+    )
+    parser.add_argument(
+        "--sensor-mode",
+        type=int,
+        default=None,
+        metavar="MODE",
+        dest="sensor_mode",
+        help=(
+            "nvarguscamerasrc sensor mode index. Higher modes run at higher "
+            "framerates (shorter sensor readout window = less rolling shutter). "
+            "Mode 4 is typically 1332x990 @ 120fps on IMX477. "
+            "Omit for default mode."
         ),
     )
     parser.add_argument(
@@ -85,7 +97,7 @@ def main():
     else:
         print("Shutter speed: auto-exposure (consider --shutter for drone flight)")
 
-    with Camera(exposure_ns=args.shutter) as cam:
+    with Camera(exposure_ns=args.shutter, sensor_mode=args.sensor_mode) as cam:
         if args.focus is not None:
             print(f"Setting fixed focus to {args.focus}...")
             cam.set_focus(args.focus)
