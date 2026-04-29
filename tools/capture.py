@@ -34,7 +34,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cv2
-from tools.camera import Camera
+from tools.camera_appsink import Camera
 
 
 def parse_args():
