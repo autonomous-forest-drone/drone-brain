@@ -24,7 +24,7 @@ INITIAL_FOCUS = 300
 COARSE_STEP = 50    # step size for full-range coarse scan
 FINE_STEP = 10      # step size for fine scan around coarse peak
 FINE_RANGE = 60     # +/- around coarse peak for fine scan
-SETTLE_TIME = 0.2   # seconds for lens to move and a fresh frame to arrive
+SETTLE_TIME = 0.3   # seconds for lens to move and a fresh frame to arrive
 CAPTURE_WIDTH = 1920
 CAPTURE_HEIGHT = 1080
 I2C_BUS = 9         # VCM motor I2C bus (active only while camera streams)
@@ -98,6 +98,12 @@ def scan(start, stop, step):
 
 def autofocus():
     """Two-pass autofocus: coarse scan 0–1000, then fine scan around the peak."""
+    # Move to scan start and wait for full VCM travel to settle.
+    # VCM may be anywhere (e.g. 530 from previous run), so allow 2s
+    # for the lens to reach position 0 before measurements begin.
+    set_focus(0)
+    time.sleep(2.0)
+
     print("  [coarse scan]")
     coarse_best, _ = scan(0, 1000, COARSE_STEP)
 

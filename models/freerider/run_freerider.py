@@ -31,7 +31,6 @@ Usage:
 
 import argparse
 import csv
-import glob
 import os
 import select
 import subprocess
@@ -60,6 +59,8 @@ import tensorrt as trt
 import torch
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
+from tools.camera import Camera
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -83,82 +84,6 @@ RC_OVERRIDE_MODES = {'ALTCTL', 'POSCTL'}
 SIM_FCU_URL       = 'udp://:14540@194.47.28.91:14580'
 SIM_IMAGE_TOPIC   = '/airsim_node/drone_1/front_center_custom/Scene'
 
-# ---------------------------------------------------------------------------
-# Camera / autofocus constants (real hardware — Arducam IMX477 + VCM motor)
-# ---------------------------------------------------------------------------
-FRAME_DIR      = '/tmp/af_frames'
-CAPTURE_WIDTH  = 1920
-CAPTURE_HEIGHT = 1080
-I2C_BUS        = 9       # VCM motor bus — active only while Argus session runs
-VCM_ADDR       = 0x0C
-COARSE_STEP    = 50
-FINE_STEP      = 10
-FINE_RANGE     = 60
-SETTLE_TIME    = 0.2     # seconds to wait after moving lens before reading frame
-INITIAL_FOCUS  = 300
-
-
-# ---------------------------------------------------------------------------
-# Camera pipeline helpers (gst-launch-1.0 + multifilesink, same as capture_gst.py)
-# ---------------------------------------------------------------------------
-
-def _start_gst_pipeline() -> subprocess.Popen:
-    """Start a persistent GStreamer pipeline writing JPEG frames to FRAME_DIR."""
-    os.makedirs(FRAME_DIR, exist_ok=True)
-    for f in glob.glob(f'{FRAME_DIR}/frame_*.jpg'):
-        os.remove(f)
-    cmd = (
-        f'gst-launch-1.0 nvarguscamerasrc ! '
-        f"'video/x-raw(memory:NVMM),width={CAPTURE_WIDTH},height={CAPTURE_HEIGHT},"
-        f"framerate=30/1' ! nvvidconv ! jpegenc ! "
-        f'multifilesink location="{FRAME_DIR}/frame_%05d.jpg" max-files=5'
-    )
-    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=None)
-    time.sleep(2.5)   # wait for Argus session to initialise
-    return proc
-
-
-def _latest_frame() -> np.ndarray | None:
-    """Return the most recent JPEG frame from the persistent pipeline, or None."""
-    files = sorted(glob.glob(f'{FRAME_DIR}/frame_*.jpg'))
-    if not files:
-        return None
-    return cv2.imread(files[-1])
-
-
-# ---------------------------------------------------------------------------
-# Autofocus helpers
-# ---------------------------------------------------------------------------
-
-def set_focus(value: int):
-    value  = max(0, min(1000, value))
-    raw    = (value << 4) & 0x3FF0
-    data1  = (raw >> 8) & 0x3F
-    data2  = raw & 0xF0
-    os.system(f'i2cset -y {I2C_BUS} 0x{VCM_ADDR:02X} {data1} {data2}')
-
-
-def _sharpness(bgr: np.ndarray) -> float:
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-
-def _focus_scan(start: int, stop: int, step: int, publish_vel_fn) -> tuple[int, float]:
-    """Scan focus values, return (best_focus, best_score)."""
-    best_focus, best_score = start, -1.0
-    for f in range(start, stop + step, step):
-        f = max(0, min(1000, f))
-        publish_vel_fn()   # keep OFFBOARD alive during scan
-        set_focus(f)
-        time.sleep(SETTLE_TIME)
-        frame = _latest_frame()
-        if frame is None:
-            continue
-        score = _sharpness(frame)
-        if score > best_score:
-            best_score = score
-            best_focus = f
-    return best_focus, best_score
 
 
 # ---------------------------------------------------------------------------
@@ -255,8 +180,8 @@ class FreeriderNode(Node):
         self._yaw           = 0.0
         self._latest_bgr    = None   # used in sim mode only
         self._frame_lock    = threading.Lock()
-        self._gst_proc      = None   # persistent GStreamer pipeline (real hardware)
-        self._best_focus    = INITIAL_FOCUS
+        self._camera        = None   # Camera instance (real hardware)
+        self._best_focus    = 0
         self._step_count    = 0
 
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -350,37 +275,33 @@ class FreeriderNode(Node):
             self.get_logger().info('[Freerider] Sim mode — using ROS image topic.')
             return
         self.get_logger().info('[Freerider] Starting GStreamer camera pipeline...')
-        self._gst_proc = _start_gst_pipeline()
+        self._camera = Camera()
+        self._camera.open()
         self.get_logger().info('[Freerider] Camera pipeline ready.')
 
     def _get_frame(self) -> np.ndarray | None:
         if self._sim:
             with self._frame_lock:
                 return self._latest_bgr.copy() if self._latest_bgr is not None else None
-        return _latest_frame()
+        return self._camera.capture()
 
     def _stop_camera(self):
-        if self._gst_proc is not None:
-            self._gst_proc.terminate()
-            self._gst_proc.wait()
-            self._gst_proc = None
+        if self._camera is not None:
+            self._camera.close()
+            self._camera = None
 
     # ------------------------------------------------------------------
     # Autofocus (real hardware only) — two-pass: coarse then fine
     # ------------------------------------------------------------------
 
     def _run_autofocus(self) -> int:
-        self.get_logger().info('[autofocus] Coarse scan (0–1000, step 50)...')
-        coarse_best, _ = _focus_scan(0, 1000, COARSE_STEP, self._publish_vel)
-
-        fine_start = max(0,    coarse_best - FINE_RANGE)
-        fine_stop  = min(1000, coarse_best + FINE_RANGE)
-        self.get_logger().info(f'[autofocus] Fine scan ({fine_start}–{fine_stop}, step {FINE_STEP})...')
-        fine_best, fine_score = _focus_scan(fine_start, fine_stop, FINE_STEP, self._publish_vel)
-
-        set_focus(fine_best)
-        self.get_logger().info(f'[autofocus] Done — best={fine_best}  sharpness={fine_score:.1f}')
-        return fine_best
+        self.get_logger().info('[autofocus] Running two-pass autofocus...')
+        best = self._camera.autofocus(
+            verbose=True,
+            step_callback=self._publish_vel,  # keeps OFFBOARD alive during scan
+        )
+        self.get_logger().info(f'[autofocus] Done — best focus: {best}')
+        return best
 
     # ------------------------------------------------------------------
     # Arm / takeoff / offboard / land
@@ -482,7 +403,7 @@ class FreeriderNode(Node):
 
         # Re-apply best focus every step to counteract vibration drift
         if not self._sim:
-            set_focus(self._best_focus)
+            self._camera.set_focus(self._best_focus)
 
         depth = self._depth.estimate(bgr)
         frame_stack.append(depth)
