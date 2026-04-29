@@ -65,12 +65,14 @@ def parse_args():
         default=None,
         metavar="MODE",
         dest="sensor_mode",
-        help=(
-            "nvarguscamerasrc sensor mode index. Higher modes run at higher "
-            "framerates (shorter sensor readout window = less rolling shutter). "
-            "Mode 4 is typically 1332x990 @ 120fps on IMX477. "
-            "Omit for default mode."
-        ),
+        help="nvarguscamerasrc sensor mode (0=4K@30fps, 1=1080p@60fps). Default: let GStreamer pick.",
+    )
+    parser.add_argument(
+        "--framerate",
+        type=int,
+        default=60,
+        metavar="FPS",
+        help="Sensor framerate. Higher = less rolling shutter. Default: 60 (matches 1080p mode).",
     )
     parser.add_argument(
         "--interval",
@@ -97,7 +99,7 @@ def main():
     else:
         print("Shutter speed: auto-exposure (consider --shutter for drone flight)")
 
-    with Camera(exposure_ns=args.shutter, sensor_mode=args.sensor_mode) as cam:
+    with Camera(exposure_ns=args.shutter, sensor_mode=args.sensor_mode, framerate=args.framerate) as cam:
         if args.focus is not None:
             print(f"Setting fixed focus to {args.focus}...")
             cam.set_focus(args.focus)

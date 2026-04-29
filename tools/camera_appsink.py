@@ -73,6 +73,7 @@ class Camera:
     def __init__(self,
                  width: int = CAPTURE_WIDTH,
                  height: int = CAPTURE_HEIGHT,
+                 framerate: int = 60,
                  exposure_ns: int | None = None,
                  sensor_mode: int | None = None,
                  verbose: bool = False):
@@ -81,18 +82,22 @@ class Camera:
         ----------
         width, height : int
             Capture resolution.
+        framerate : int
+            Sensor framerate.  Higher = shorter readout window = less rolling
+            shutter.  This camera supports:
+                mode 0  →  3840×2160 @ 30 fps
+                mode 1  →  1920×1080 @ 60 fps  (default, use this for flight)
+            Default is 60 to match mode 1.
         exposure_ns : int | None
             Fixed shutter speed in nanoseconds.  Omit for auto-exposure.
         sensor_mode : int | None
-            nvarguscamerasrc sensor mode index.
-                0  →  1920×1080 @ 30 fps   (default, more rolling shutter)
-                3  →  1332×990  @ 120 fps  (recommended for flight)
-            None lets GStreamer pick the default.
+            nvarguscamerasrc sensor mode index.  None lets GStreamer pick.
         verbose : bool
             Print the GStreamer pipeline string before opening it.
         """
         self.width = width
         self.height = height
+        self.framerate = framerate
         self.exposure_ns = exposure_ns
         self.sensor_mode = sensor_mode
         self.verbose = verbose
@@ -136,7 +141,7 @@ class Camera:
 
         return (
             f"nvarguscamerasrc {src_props_str} ! "
-            f"video/x-raw(memory:NVMM),width={self.width},height={self.height},framerate=30/1 ! "
+            f"video/x-raw(memory:NVMM),width={self.width},height={self.height},framerate={self.framerate}/1 ! "
             f"nvvidconv ! "
             f"video/x-raw,format=BGRx ! "
             f"videoconvert ! "
