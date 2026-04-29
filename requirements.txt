@@ -17,7 +17,8 @@
 
 # --- core (freerider runtime + fortune cookie) --------------------------
 numpy
-opencv-python           # cv2
+# opencv-python         # DO NOT install via pip on Jetson — use JetPack OpenCV
+                        # (pip version lacks GStreamer support and breaks the camera)
 Pillow                  # PIL — used by depth estimator
 torch                   # On Jetson use the JetPack wheel, not PyPI:
                         #   pip install torch --index-url https://pypi.jetson-ai-lab.dev/jp6/cu126
