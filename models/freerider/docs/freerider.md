@@ -92,9 +92,26 @@ python3 run_freerider.py --engine ~/freerider/models/freerider_actor.trt
 The script:
 1. Loads the TRT engine and the Depth Anything V2 depth estimator.
 2. Waits for MAVROS connection then arms and climbs to 1.5 m.
-3. Streams velocity commands at ~5 Hz, blending raw policy output with the previous action (`momentum = 0.3`).
-4. Monitors RC: switching from OFFBOARD to ALTCTL / POSCTL hands control back to the pilot immediately.
-5. On landing, uploads the CSV log and debug frames to Dropbox via rclone and prints step-latency statistics.
+3. Runs a two-pass autofocus scan (coarse 0–1000, then fine around the peak) while hovering.
+4. Streams velocity commands at ~5 Hz, blending raw policy output with the previous action (`momentum = 0.3`).
+5. Monitors RC: switching from OFFBOARD to ALTCTL / POSCTL hands control back to the pilot immediately.
+6. On landing, prints step-latency statistics.
+
+#### Skipping autofocus with a known focus value
+
+If you already know the best focus value for the current location (e.g. from a previous flight), pass it with `--focus` to skip the autofocus scan and start flying immediately:
+
+```bash
+python3 run_freerider.py --engine ~/freerider/models/freerider_actor.trt --focus 550
+```
+
+The focus value (0–1000) is set once on hover and re-applied every avoidance step to counteract vibration drift. To find a good value for a new location, run `capture_gst.py` on the ground first:
+
+```bash
+cd ~/drone-brain
+sudo python3 tests/sensor_tests/capture_gst.py
+# Best focus: 550  ← use this with --focus
+```
 
 **Triggering:** switch RC ch5 to OFFBOARD. Switch back at any time to reclaim control.
 
