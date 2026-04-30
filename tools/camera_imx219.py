@@ -35,7 +35,7 @@ class Camera:
     def __init__(self,
                  width: int = CAPTURE_WIDTH,
                  height: int = CAPTURE_HEIGHT,
-                 framerate: int = 29,
+                 framerate: int = 30,
                  exposure_ns: int | None = None,
                  verbose: bool = False):
         """
