@@ -35,6 +35,7 @@ import os
 import select
 import subprocess
 import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
 import termios
 import threading
 import time

@@ -7,10 +7,26 @@ autofocus() functions.
 
 Requires root (sudo) to run — i2cset needs elevated privileges.
 
+Rolling shutter note
+--------------------
+The IMX477 is a rolling-shutter sensor: rows are exposed sequentially from
+top to bottom, so a fast-moving subject (or drone) causes each row to capture
+a slightly different instant, producing horizontal skew or "jello".
+
+The most effective software mitigation is a very short, fixed shutter speed:
+the narrower the exposure window, the less time elapses between the first and
+last row, making the artifact negligible at typical drone speeds.
+
+Pass ``exposure_ns`` (nanoseconds) to lock shutter speed.  Common values:
+    500_000   →  1/2000 s   good for fast drone motion
+    1_000_000 →  1/1000 s   good default for moderate motion
+    2_000_000 →  1/500 s    slow/hover
+    None                    ISP auto-exposure (not recommended in flight)
+
 Usage:
     from tools.camera import Camera
 
-    with Camera() as cam:
+    with Camera(exposure_ns=500_000) as cam:
         cam.set_focus(400)
         frame = cam.capture()          # returns BGR numpy array
 
@@ -55,9 +71,32 @@ class Camera:
     def __init__(self,
                  width: int = CAPTURE_WIDTH,
                  height: int = CAPTURE_HEIGHT,
+                 exposure_ns: int | None = None,
+                 sensor_mode: int | None = None,
                  verbose: bool = False):
+        """
+        Parameters
+        ----------
+        width, height : int
+            Capture resolution.
+        exposure_ns : int | None
+            Fixed shutter speed in nanoseconds.  When set, auto-exposure is
+            disabled.  Omit for auto-exposure.
+        sensor_mode : int | None
+            nvarguscamerasrc sensor-id / mode index.  Higher modes on the
+            IMX477 run at higher framerates (shorter readout window), which
+            reduces true rolling-shutter skew:
+                None / 0  →  1920×1080 @ 30 fps  (default)
+                4         →  1332×990  @ 120 fps  (4× less rolling shutter)
+            Check ``v4l2-ctl --list-formats-ext`` for the modes your
+            firmware exposes.  None lets GStreamer pick the default.
+        verbose : bool
+            Forward GStreamer stderr to the terminal.
+        """
         self.width = width
         self.height = height
+        self.exposure_ns = exposure_ns
+        self.sensor_mode = sensor_mode
         self.verbose = verbose
         self._proc = None
 
@@ -98,8 +137,17 @@ class Camera:
         for f in glob.glob(f"{FRAME_DIR}/frame_*.jpg"):
             os.remove(f)
 
+        src_props = []
+        if self.sensor_mode is not None:
+            src_props.append(f"sensor-mode={int(self.sensor_mode)}")
+        if self.exposure_ns is not None:
+            exp_ns = int(self.exposure_ns)
+            src_props.append(f"aelock=true exposuretimerange=\"{exp_ns} {exp_ns}\"")
+
+        src_props_str = " ".join(src_props)
+
         cmd = (
-            f"gst-launch-1.0 nvarguscamerasrc ! "
+            f"gst-launch-1.0 nvarguscamerasrc {src_props_str} ! "
             f"'video/x-raw(memory:NVMM),width={self.width},height={self.height},"
             f"framerate=30/1' ! nvvidconv ! jpegenc ! "
             f'multifilesink location="{FRAME_DIR}/frame_%05d.jpg" max-files=5'
@@ -129,11 +177,17 @@ class Camera:
     # ------------------------------------------------------------------ #
 
     def capture(self) -> np.ndarray | None:
-        """Return the latest frame from the pipeline as a BGR numpy array."""
+        """Return the latest *completed* frame from the pipeline as a BGR numpy array.
+
+        multifilesink streams JPEG data into files without atomic writes, so
+        files[-1] (alphabetically last) is the file currently being written and
+        may contain rows from two different frames.  files[-2] is the most
+        recently *finished* write and is safe to read.
+        """
         files = sorted(glob.glob(f"{FRAME_DIR}/frame_*.jpg"))
-        if not files:
+        if len(files) < 2:
             return None
-        return cv2.imread(files[-1])
+        return cv2.imread(files[-2])
 
     def set_focus(self, value: int):
         """
