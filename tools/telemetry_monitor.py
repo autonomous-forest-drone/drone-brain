@@ -25,56 +25,53 @@ STATUS_MAP = {-1: 'NO FIX', 0: 'FIX', 1: 'SBAS FIX', 2: 'GBAS FIX'}
 
 
 class DroneDataSubscriber(Node):
-    def __init__(self, mode):
+    def __init__(self, modes):
         super().__init__('telemetry_monitor_subscriber')
-        self.mode = mode
 
         # BEST_EFFORT QoS matches mavros sensor topics which don't guarantee delivery
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
-        # Subscribe only to the topic matching the requested argument
-        if mode == 'battery':
+        if 'battery' in modes:
             self.create_subscription(BatteryState, '/mavros/battery', self.battery_callback, qos)
             self.get_logger().info('Listening to /mavros/battery ...')
-        elif mode == 'gps':
+        if 'gps' in modes:
             self.create_subscription(NavSatFix, '/mavros/global_position/global', self.gps_callback, qos)
             self.get_logger().info('Listening to /mavros/global_position/global ...')
-        elif mode == 'imu':
+        if 'imu' in modes:
             self.create_subscription(Imu, '/mavros/imu/data_raw', self.imu_callback, qos)
             self.get_logger().info('Listening to /mavros/imu/data_raw ...')
 
     def battery_callback(self, msg):
-        # Print voltage, charge percentage, and current draw on a single updating line
-        print(f'\r⚡ Voltage: {msg.voltage:.2f}V  |  Charge: {msg.percentage * 100:.1f}%  |  Current: {msg.current:.2f}A    ', end='', flush=True)
+        print(f'[BAT]  Voltage: {msg.voltage:.2f}V  |  Charge: {msg.percentage * 100:.1f}%  |  Current: {msg.current:.2f}A')
 
     def gps_callback(self, msg):
-        # Look up the fix status string, defaulting to UNKNOWN for unrecognised codes
         status = STATUS_MAP.get(msg.status.status, 'UNKNOWN')
-        print(f'\r🛰  Lat: {msg.latitude:.6f}  Lon: {msg.longitude:.6f}  Alt: {msg.altitude:.2f}m  Status: {status}    ', end='', flush=True)
+        print(f'[GPS]  Lat: {msg.latitude:.6f}  Lon: {msg.longitude:.6f}  Alt: {msg.altitude:.2f}m  Status: {status}')
 
     def imu_callback(self, msg):
-        # Unpack linear acceleration and angular velocity vectors for cleaner formatting
         a = msg.linear_acceleration
         g = msg.angular_velocity
         print(
-            f'\r📐 Accel(m/s²) x={a.x:7.3f}  y={a.y:7.3f}  z={a.z:7.3f}  |  '
-            f'Gyro(rad/s) x={g.x:7.3f}  y={g.y:7.3f}  z={g.z:7.3f}    ',
-            end='', flush=True
+            f'[IMU]  Accel(m/s²) x={a.x:7.3f}  y={a.y:7.3f}  z={a.z:7.3f}  |  '
+            f'Gyro(rad/s) x={g.x:7.3f}  y={g.y:7.3f}  z={g.z:7.3f}'
         )
 
 
 def main():
     valid_modes = ['battery', 'gps', 'imu']
 
-    # Validate argument — strip leading dashes so both 'gps' and '-gps' work
-    if len(sys.argv) < 2 or sys.argv[1].lstrip('-') not in valid_modes:
-        print(f'Usage: python3 telemetry_monitor.py -battery | -gps | -imu')
-        sys.exit(1)
-
-    mode = sys.argv[1].lstrip('-')
+    if len(sys.argv) < 2:
+        modes = valid_modes
+    else:
+        modes = [a.lstrip('-') for a in sys.argv[1:]]
+        invalid = [m for m in modes if m not in valid_modes]
+        if invalid:
+            print(f'Usage: python3 telemetry_monitor.py [-battery] [-gps] [-imu]')
+            print(f'       (no arguments streams everything)')
+            sys.exit(1)
 
     rclpy.init()
-    node = DroneDataSubscriber(mode)
+    node = DroneDataSubscriber(modes)
     try:
         # spin() blocks here, calling callbacks as messages arrive
         rclpy.spin(node)
