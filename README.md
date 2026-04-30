@@ -121,7 +121,7 @@ Standalone utilities to run in a separate terminal alongside flight scripts.
 
 | Script | Description |
 |---|---|
-| `telemetry_monitor.py` | Live GPS, IMU, or battery readout from MAVROS (`-gps`, `-imu`, `-battery`) |
+| `telemetry_monitor.py` | Live GPS, IMU, or battery readout (`-gps`, `-imu`, `-battery`). Launches MAVROS automatically as a subprocess. |
 | `image_sender.py` | Captures an IMX477 frame and sends it to the GCS over MAVROS Tunnel messages |
 | `camera_stream.py` | Streams the IMX477 feed over a network socket for remote viewing |
 | `midas_viewer.py` | Displays live MiDaS depth output on-screen for visual inspection |
@@ -172,15 +172,15 @@ sudo usermod -a -G dialout $USER
 pip install -r requirements.txt
 ```
 
-### MAVROS — real hardware
+### MAVROS
+
+`telemetry_monitor.py` launches MAVROS automatically. If you need to start it manually (e.g. for flight scripts):
 
 ```bash
+# Real hardware
 ros2 launch mavros px4.launch fcu_url:=/dev/ttyTHS1:115200
-```
 
-### MAVROS — AirSim simulation
-
-```bash
+# AirSim simulation
 ros2 launch mavros px4.launch fcu_url:=udp://:14540@127.0.0.1:14580
 ```
 

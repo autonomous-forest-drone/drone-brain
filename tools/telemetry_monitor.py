@@ -1,27 +1,36 @@
 
 
-"""
-The following commands were used to open the terminal, which would run in the background fetching the nodes to subscribe to the pixhawk, the ros library in this code subs from the other end reading the data
-
-The command:
-  source /opt/ros/humble/setup.bash
-  ros2 launch mavros px4.launch fcu_url:=/dev/ttyACM0
-"""
-
 import sys
+import os
+import subprocess
+import time
 
-
-# ROS2 core libraries for creating nodes and managing communication
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-
-# Message types for GPS, IMU, and battery data from mavros
 from sensor_msgs.msg import NavSatFix, Imu, BatteryState
 
 
-# Maps GPS status codes to human-readable strings
+FCU_URL = '/dev/ttyTHS1:115200'
+ROS_SETUP = '/opt/ros/humble/setup.bash'
+
 STATUS_MAP = {-1: 'NO FIX', 0: 'FIX', 1: 'SBAS FIX', 2: 'GBAS FIX'}
+
+
+def start_mavros():
+    env = os.environ.copy()
+    # Source the ROS setup by inheriting an already-sourced shell, or patch PATH/LD directly.
+    # Easiest cross-shell approach: ask bash to source the file then exec the command.
+    cmd = f'source {ROS_SETUP} && ros2 launch mavros px4.launch fcu_url:={FCU_URL}'
+    proc = subprocess.Popen(
+        ['bash', '-c', cmd],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+    print(f'MAVROS started (pid {proc.pid}), waiting for it to come up...')
+    time.sleep(5)
+    return proc
 
 
 class DroneDataSubscriber(Node):
@@ -66,24 +75,25 @@ class DroneDataSubscriber(Node):
 def main():
     valid_modes = ['battery', 'gps', 'imu']
 
-    # Validate argument — strip leading dashes so both 'gps' and '-gps' work
     if len(sys.argv) < 2 or sys.argv[1].lstrip('-') not in valid_modes:
         print(f'Usage: python3 telemetry_monitor.py -battery | -gps | -imu')
         sys.exit(1)
 
     mode = sys.argv[1].lstrip('-')
 
+    mavros_proc = start_mavros()
+
     rclpy.init()
     node = DroneDataSubscriber(mode)
     try:
-        # spin() blocks here, calling callbacks as messages arrive
         rclpy.spin(node)
     except KeyboardInterrupt:
         print()
     finally:
-        # Always clean up the node and shut down rclpy on exit
         node.destroy_node()
         rclpy.shutdown()
+        mavros_proc.terminate()
+        mavros_proc.wait()
 
 
 if __name__ == '__main__':
