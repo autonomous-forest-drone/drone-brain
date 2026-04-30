@@ -21,7 +21,7 @@ import time
 
 CAPTURE_WIDTH  = 1920
 CAPTURE_HEIGHT = 1080
-SENSOR_ID      = 1      # camera1 CSI port on Jetson Orin Nano
+SENSOR_ID      = 0      # source index 0 (camera1 CSI port maps to sensor-id=0 in this device tree)
 
 
 class Camera:
