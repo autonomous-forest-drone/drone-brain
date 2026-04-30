@@ -6,12 +6,10 @@ FREERIDER — PPO obstacle avoidance flight script.
   • Freerider actor (TensorRT FP16) with two inputs: image stack + state
   • 3-frame depth stack  (3 × 144 × 256)
   • Action smoothing matching training: smoothed = 0.7 * raw + 0.3 * prev
-  • Two-pass autofocus on hover after takeoff (real hardware only)
-  • Per-flight logs: flight_logs/<timestamp>/{frames/, depth/, flight.csv, flight.png}
+  • Per-flight logs: images/<timestamp>/{frames/, depth/, flight.csv, flight.png}
 
 Camera (real hardware):
-  Uses a persistent gst-launch-1.0 pipeline writing JPEGs to /tmp/af_frames/
-  (same approach as capture_gst.py — required for VCM motor to respond).
+  IMX219 fixed-focus camera on camera1 CSI port (sensor-id=0), read via appsink.
 
 Velocity (body frame):
     fwd = FIXED_SPEED - MAX_LATERAL * |smoothed|
@@ -19,8 +17,7 @@ Velocity (body frame):
 
 Flow:
     wait for MAVROS → keypress → arm → AUTO.TAKEOFF → wait climb
-    → start camera pipeline → OFFBOARD → autofocus hover
-    → avoidance loop until RC override → AUTO.LAND
+    → start camera pipeline → OFFBOARD → avoidance loop until RC override → AUTO.LAND
 
 RC override: switching to ALTCTL or POSCTL at any time exits the loop.
 
@@ -60,7 +57,7 @@ import tensorrt as trt
 import torch
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
-from tools.camera import Camera
+from tools.camera_imx219 import Camera
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -166,8 +163,7 @@ class DepthEstimator:
 class FreeriderNode(Node):
 
     def __init__(self, engine_path: str, flight_dir: str, sim: bool = False,
-                 sim_image_topic: str = SIM_IMAGE_TOPIC,
-                 focus: int | None = None):
+                 sim_image_topic: str = SIM_IMAGE_TOPIC):
         super().__init__('freerider')
 
         self._sim        = sim
@@ -183,7 +179,6 @@ class FreeriderNode(Node):
         self._latest_bgr    = None   # used in sim mode only
         self._frame_lock    = threading.Lock()
         self._camera        = None   # Camera instance (real hardware)
-        self._best_focus    = focus if focus is not None else 0
         self._step_count    = 0
 
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -293,19 +288,6 @@ class FreeriderNode(Node):
             self._camera = None
 
     # ------------------------------------------------------------------
-    # Autofocus (real hardware only) — two-pass: coarse then fine
-    # ------------------------------------------------------------------
-
-    def _run_autofocus(self) -> int:
-        self.get_logger().info('[autofocus] Running two-pass autofocus...')
-        best = self._camera.autofocus(
-            verbose=True,
-            step_callback=self._publish_vel,  # keeps OFFBOARD alive during scan
-        )
-        self.get_logger().info(f'[autofocus] Done — best focus: {best}')
-        return best
-
-    # ------------------------------------------------------------------
     # Arm / takeoff / offboard / land
     # ------------------------------------------------------------------
 
@@ -402,10 +384,6 @@ class FreeriderNode(Node):
             return frame_stack, smoothed_action, smoothed_action, 0.0, 0.0, 0.0
 
         t_step_start = time.monotonic()
-
-        # Re-apply best focus every step to counteract vibration drift
-        if not self._sim:
-            self._camera.set_focus(self._best_focus)
 
         depth = self._depth.estimate(bgr)
         frame_stack.append(depth)
@@ -508,9 +486,6 @@ class FreeriderNode(Node):
         if not result:
             self.get_logger().error('Failed to enter OFFBOARD — aborting.')
             return
-
-        if not self._sim and self._best_focus == 0:
-            self._best_focus = self._run_autofocus()
 
         latencies   = []
         frame_stack = deque(maxlen=N_FRAMES)
@@ -639,8 +614,6 @@ def main():
                         help='Sim mode: connect via UDP, skip keypress, use ROS image topic.')
     parser.add_argument('--sim-image-topic', default=SIM_IMAGE_TOPIC,
                         help=f'ROS image topic in sim mode (default: {SIM_IMAGE_TOPIC})')
-    parser.add_argument('--focus', type=int, default=None,
-                        help='Skip autofocus and use this fixed focus value (0–1000).')
     args = parser.parse_args()
 
     stamp      = time.strftime('%Y-%m-%d_%H-%M-%S')
@@ -656,17 +629,13 @@ def main():
         print(f'Camera     : {args.sim_image_topic}')
     else:
         print('Mode       : Real hardware')
-        if args.focus is not None:
-            print(f'Focus      : fixed at {args.focus} (autofocus skipped)')
-        else:
-            print('Autofocus  : two-pass coarse+fine on hover after takeoff')
+        print('Camera     : IMX219 fixed-focus (sensor-id=0)')
         print('RC override: switch to ALTCTL or POSCTL at any time')
     print('=' * 60)
 
     rclpy.init()
     node = FreeriderNode(args.engine, flight_dir, sim=args.sim,
-                         sim_image_topic=args.sim_image_topic,
-                         focus=args.focus)
+                         sim_image_topic=args.sim_image_topic)
     try:
         node.run()
     except KeyboardInterrupt:
