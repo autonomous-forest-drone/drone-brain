@@ -499,7 +499,8 @@ class FreeriderNode(Node):
         state_np          = np.array([accumulated_state], dtype=np.float32)
 
         raw_action        = float(np.clip(self._trt.infer(image_np, state_np), -1.0, 1.0))
-        new_smoothed      = SMOOTH_ALPHA * raw_action + ACTION_MOMENTUM * smoothed_action
+        # new_smoothed    = SMOOTH_ALPHA * raw_action + ACTION_MOMENTUM * smoothed_action
+        new_smoothed      = raw_action
         new_accumulated   = accumulated_state + new_smoothed
 
         fwd = FIXED_SPEED - MAX_LATERAL * abs(new_smoothed)
