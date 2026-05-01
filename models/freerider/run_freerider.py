@@ -39,10 +39,18 @@ import time
 import tty
 from collections import deque
 
+import torch
+torch.cuda.init()  # create PyTorch primary CUDA context first
+
 import cv2
 import numpy as np
-import pycuda.autoinit  # noqa: F401 — initialises CUDA context
 import pycuda.driver as cuda
+
+# Attach pycuda to the same primary context that PyTorch already created.
+cuda.init()
+_pycuda_ctx = cuda.Device(torch.cuda.current_device()).retain_primary_context()
+_pycuda_ctx.push()
+
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import TwistStamped
@@ -54,7 +62,6 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image as RosImage
 import tensorrt as trt
-import torch
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
 from tools.camera_imx219 import Camera

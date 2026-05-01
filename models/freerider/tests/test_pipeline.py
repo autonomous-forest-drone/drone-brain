@@ -31,12 +31,18 @@ from collections import deque
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 
 import torch
-torch.cuda.init()  # must initialise PyTorch CUDA context before pycuda.autoinit
+torch.cuda.init()  # create PyTorch primary CUDA context first
 
 import cv2
 import numpy as np
-import pycuda.autoinit  # noqa: F401
 import pycuda.driver as cuda
+
+# Attach pycuda to the same primary context that PyTorch already created,
+# instead of letting pycuda.autoinit spin up a competing context.
+cuda.init()
+_pycuda_ctx = cuda.Device(torch.cuda.current_device()).retain_primary_context()
+_pycuda_ctx.push()
+
 import tensorrt as trt
 from PIL import Image as PILImage
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
