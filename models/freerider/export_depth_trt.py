@@ -30,9 +30,11 @@ import torch.nn as nn
 DEPTH_MODEL_ID = 'depth-anything/Depth-Anything-V2-Small-hf'
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model')
 
-# DepthAnything V2 processor always resizes to 518×518 (ViT-S patch stride 14)
+# Processor output size for a 1920×1080 camera frame:
+# scales height to 518, preserves aspect ratio, rounds width to multiple of 14 → 924.
+# Override with --input-h / --input-w if your camera resolution differs.
 INPUT_H = 518
-INPUT_W = 518
+INPUT_W = 924
 
 
 class _DepthWrapper(nn.Module):
