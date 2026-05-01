@@ -281,6 +281,131 @@ def _plot_log(flight_dir: str):
 
 
 # ---------------------------------------------------------------------------
+# HUD composite frame
+# ---------------------------------------------------------------------------
+
+# Display size for each panel in the HUD
+_DISP_W, _DISP_H = 640, 360
+_BAR_H            = 70   # height of the action strip below the panels
+
+
+def _draw_hud(bgr: np.ndarray,
+              depth: np.ndarray,        # float32 normalised 0-1, shape (H, W)
+              raw_action: float,
+              smoothed: float,
+              fwd: float,
+              lat: float,
+              step: int,
+              latency_ms: float) -> np.ndarray:
+    """Build a 1280×(360+70) BGR composite frame for display / combined video."""
+    W, H, BH = _DISP_W, _DISP_H, _BAR_H
+
+    # --- left panel: camera ------------------------------------------------
+    cam = cv2.resize(bgr, (W, H), interpolation=cv2.INTER_LINEAR)
+
+    # Steering arrow: from bottom-centre, deflected left/right by smoothed
+    cx = W // 2
+    tip_x = cx + int(smoothed * W * 0.40)
+    tip_y = H // 3
+    base_y = H - 20
+    mag = abs(smoothed)
+    if mag < 0.3:
+        arrow_color = (0, 220, 0)       # green
+    elif mag < 0.6:
+        arrow_color = (0, 200, 220)     # yellow
+    else:
+        arrow_color = (0, 60, 230)      # red
+    cv2.arrowedLine(cam, (cx, base_y), (tip_x, tip_y),
+                    arrow_color, 3, tipLength=0.25)
+
+    # Step counter
+    cv2.putText(cam, f'step {step:06d}', (8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+
+    # --- right panel: depth (inferno colormap) -----------------------------
+    depth_u8  = (depth * 255).astype(np.uint8)
+    depth_col = cv2.applyColorMap(depth_u8, cv2.COLORMAP_INFERNO)
+    depth_pan = cv2.resize(depth_col, (W, H), interpolation=cv2.INTER_LINEAR)
+    cv2.putText(depth_pan, 'depth', (8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+
+    # --- bottom strip: action bar + telemetry text -------------------------
+    bar = np.zeros((BH, W * 2, 3), dtype=np.uint8)
+
+    # Background
+    bar[:] = (30, 30, 30)
+
+    # Horizontal action bar centred on the strip
+    bar_cx  = W              # centre of the full-width strip
+    bar_y0, bar_y1 = 12, 38
+    bar_max_half = W - 40    # max pixel extent each side
+
+    # Grey track
+    cv2.rectangle(bar, (bar_cx - bar_max_half, bar_y0),
+                       (bar_cx + bar_max_half, bar_y1), (70, 70, 70), -1)
+    # Smoothed action fill
+    fill_w = int(abs(smoothed) * bar_max_half)
+    fill_color = (50, 180, 50) if smoothed >= 0 else (50, 50, 200)
+    if smoothed >= 0:
+        cv2.rectangle(bar, (bar_cx, bar_y0),
+                           (bar_cx + fill_w, bar_y1), fill_color, -1)
+    else:
+        cv2.rectangle(bar, (bar_cx - fill_w, bar_y0),
+                           (bar_cx, bar_y1), fill_color, -1)
+    # Centre tick
+    cv2.line(bar, (bar_cx, bar_y0 - 2), (bar_cx, bar_y1 + 2), (200, 200, 200), 2)
+
+    # Telemetry text
+    txt = (f'raw={raw_action:+.3f}  smooth={smoothed:+.3f}  '
+           f'fwd={fwd:.3f}  lat={lat:+.3f}  {latency_ms:.0f}ms')
+    cv2.putText(bar, txt, (10, BH - 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # --- assemble ----------------------------------------------------------
+    top  = np.hstack([cam, depth_pan])
+    return np.vstack([top, bar])
+
+
+# ---------------------------------------------------------------------------
+# Video export
+# ---------------------------------------------------------------------------
+
+def _make_video(flight_dir: str, fps: int = SETPOINT_HZ):
+    frames_dir = os.path.join(flight_dir, 'frames')
+    depth_dir  = os.path.join(flight_dir, 'depth')
+
+    frame_files = sorted(f for f in os.listdir(frames_dir) if f.endswith('.jpg'))
+    if not frame_files:
+        return
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+
+    sample = cv2.imread(os.path.join(frames_dir, frame_files[0]))
+    fh, fw = sample.shape[:2]
+
+    depth_sample = cv2.imread(os.path.join(depth_dir, frame_files[0]))
+    dh, dw = depth_sample.shape[:2] if depth_sample is not None else (fh, fw)
+
+    out_frames = os.path.join(flight_dir, 'frames.mp4')
+    out_depth  = os.path.join(flight_dir, 'depth.mp4')
+    vw_frames  = cv2.VideoWriter(out_frames, fourcc, fps, (fw, fh))
+    vw_depth   = cv2.VideoWriter(out_depth,  fourcc, fps, (dw, dh))
+
+    for fname in frame_files:
+        bgr   = cv2.imread(os.path.join(frames_dir, fname))
+        depth = cv2.imread(os.path.join(depth_dir,  fname))
+        if bgr is not None:
+            vw_frames.write(bgr)
+        if depth is not None:
+            vw_depth.write(depth)
+
+    vw_frames.release()
+    vw_depth.release()
+    print(f'[video] saved → {out_frames}')
+    print(f'[video] saved → {out_depth}')
+
+
+# ---------------------------------------------------------------------------
 # Dropbox sync
 # ---------------------------------------------------------------------------
 
@@ -308,6 +433,10 @@ def main():
         '--engine',
         default=ENGINE_PATH,
         help='Path to TensorRT engine (.trt)',
+    )
+    parser.add_argument(
+        '--display', action='store_true',
+        help='Show live HUD window (requires a connected display)',
     )
     args = parser.parse_args()
 
@@ -346,6 +475,15 @@ def main():
         't', 'raw_action', 'smoothed_action',
         'forward_vel', 'lateral_vel', 'step_latency_ms',
     ])
+
+    # Combined HUD video writer (always on)
+    hud_path   = os.path.join(flight_dir, 'combined.mp4')
+    hud_writer = cv2.VideoWriter(
+        hud_path,
+        cv2.VideoWriter_fourcc(*'mp4v'),
+        SETPOINT_HZ,
+        (_DISP_W * 2, _DISP_H + _BAR_H),
+    )
 
     frame_stack = deque(maxlen=N_FRAMES)
     smoothed    = 0.0
@@ -401,6 +539,14 @@ def main():
                     f'{step_latency_ms:.0f}ms'
                 )
 
+                hud = _draw_hud(bgr, depth, raw_action, smoothed,
+                                fwd, lat, step_count, step_latency_ms)
+                hud_writer.write(hud)
+                if args.display:
+                    cv2.imshow('Freerider — Pipeline Test', hud)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        raise KeyboardInterrupt
+
                 elapsed   = time.monotonic() - t_step
                 sleep_for = (1.0 / SETPOINT_HZ) - elapsed
                 if sleep_for > 0:
@@ -410,6 +556,9 @@ def main():
             print(f'\nStopped. {step_count} steps recorded.')
         finally:
             log_file.close()
+            hud_writer.release()
+            if args.display:
+                cv2.destroyAllWindows()
 
     if latencies:
         print(
@@ -419,6 +568,7 @@ def main():
         )
 
     _plot_log(flight_dir)
+    _make_video(flight_dir)
     _sync_dropbox(flight_dir, stamp)
 
 

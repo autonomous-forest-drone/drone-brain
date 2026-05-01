@@ -591,6 +591,45 @@ def _plot_flight_log(flight_dir: str):
 
 
 # ---------------------------------------------------------------------------
+# Video export
+# ---------------------------------------------------------------------------
+
+def _make_video(flight_dir: str, fps: int = SETPOINT_HZ):
+    frames_dir = os.path.join(flight_dir, 'frames')
+    depth_dir  = os.path.join(flight_dir, 'depth')
+
+    frame_files = sorted(f for f in os.listdir(frames_dir) if f.endswith('.jpg'))
+    if not frame_files:
+        return
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+
+    sample = cv2.imread(os.path.join(frames_dir, frame_files[0]))
+    fh, fw = sample.shape[:2]
+
+    depth_sample = cv2.imread(os.path.join(depth_dir, frame_files[0]))
+    dh, dw = depth_sample.shape[:2] if depth_sample is not None else (fh, fw)
+
+    out_frames = os.path.join(flight_dir, 'frames.mp4')
+    out_depth  = os.path.join(flight_dir, 'depth.mp4')
+    vw_frames  = cv2.VideoWriter(out_frames, fourcc, fps, (fw, fh))
+    vw_depth   = cv2.VideoWriter(out_depth,  fourcc, fps, (dw, dh))
+
+    for fname in frame_files:
+        bgr   = cv2.imread(os.path.join(frames_dir, fname))
+        depth = cv2.imread(os.path.join(depth_dir,  fname))
+        if bgr is not None:
+            vw_frames.write(bgr)
+        if depth is not None:
+            vw_depth.write(depth)
+
+    vw_frames.release()
+    vw_depth.release()
+    print(f'[video] saved → {out_frames}')
+    print(f'[video] saved → {out_depth}')
+
+
+# ---------------------------------------------------------------------------
 # Dropbox sync
 # ---------------------------------------------------------------------------
 
@@ -658,6 +697,7 @@ def main():
         node.destroy_node()
         rclpy.shutdown()
         _plot_flight_log(flight_dir)
+        _make_video(flight_dir)
         if not args.sim:
             _sync_dropbox(flight_dir, stamp)
 
