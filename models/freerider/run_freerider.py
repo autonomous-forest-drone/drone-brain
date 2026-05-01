@@ -247,10 +247,11 @@ class DepthEstimatorTRT:
 class FreeriderNode(Node):
 
     def __init__(self, engine_path: str, flight_dir: str, sim: bool = False,
-                 sim_image_topic: str = SIM_IMAGE_TOPIC):
+                 sim_image_topic: str = SIM_IMAGE_TOPIC, no_save: bool = False):
         super().__init__('freerider')
 
         self._sim        = sim
+        self._no_save    = no_save
         self._flight_dir = flight_dir
         self._frames_dir = os.path.join(flight_dir, 'frames')
         self._depth_dir  = os.path.join(flight_dir, 'depth')
@@ -307,13 +308,16 @@ class FreeriderNode(Node):
             'forward_vel', 'lateral_vel', 'step_latency_ms',
         ])
 
-        hud_path         = os.path.join(flight_dir, 'combined.mp4')
-        self._hud_writer = cv2.VideoWriter(
-            hud_path,
-            cv2.VideoWriter_fourcc(*'mp4v'),
-            SETPOINT_HZ,
-            (_DISP_W * 2, _DISP_H + _BAR_H),
-        )
+        if not no_save:
+            hud_path         = os.path.join(flight_dir, 'combined.mp4')
+            self._hud_writer = cv2.VideoWriter(
+                hud_path,
+                cv2.VideoWriter_fourcc(*'mp4v'),
+                SETPOINT_HZ,
+                (_DISP_W * 2, _DISP_H + _BAR_H),
+            )
+        else:
+            self._hud_writer = None
 
     # ------------------------------------------------------------------
     # ROS callbacks
@@ -515,16 +519,18 @@ class FreeriderNode(Node):
             f'  [{stamp}]  raw={raw_action:+.3f}  smooth={new_smoothed:+.3f}  '
             f'fwd={fwd:.3f}  lat={lat:+.3f}  {step_latency_ms:.0f}ms'
         )
-        if self._step_count % RGB_SAVE_EVERY == 0:
-            cv2.imwrite(os.path.join(self._frames_dir, f'{stamp}.jpg'), bgr)
-        cv2.imwrite(
-            os.path.join(self._depth_dir, f'{stamp}.jpg'),
-            (depth * 255).astype(np.uint8),
-        )
+        if not self._no_save:
+            if self._step_count % RGB_SAVE_EVERY == 0:
+                cv2.imwrite(os.path.join(self._frames_dir, f'{stamp}.jpg'), bgr)
+            cv2.imwrite(
+                os.path.join(self._depth_dir, f'{stamp}.jpg'),
+                (depth * 255).astype(np.uint8),
+            )
 
-        hud = _draw_hud(bgr, depth, raw_action, new_smoothed,
-                        fwd, lat, self._step_count, step_latency_ms)
-        self._hud_writer.write(hud)
+        if self._hud_writer is not None:
+            hud = _draw_hud(bgr, depth, raw_action, new_smoothed,
+                            fwd, lat, self._step_count, step_latency_ms)
+            self._hud_writer.write(hud)
 
         return frame_stack, raw_action, new_smoothed, fwd, lat, step_latency_ms
 
@@ -810,6 +816,8 @@ def main():
                         help='Sim mode: connect via UDP, skip keypress, use ROS image topic.')
     parser.add_argument('--sim-image-topic', default=SIM_IMAGE_TOPIC,
                         help=f'ROS image topic in sim mode (default: {SIM_IMAGE_TOPIC})')
+    parser.add_argument('--no-save', action='store_true',
+                        help='Skip saving frames and depth JPEGs (measures pure pipeline latency)')
     args = parser.parse_args()
 
     stamp      = time.strftime('%Y-%m-%d_%H-%M-%S')
@@ -831,7 +839,8 @@ def main():
 
     rclpy.init()
     node = FreeriderNode(args.engine, flight_dir, sim=args.sim,
-                         sim_image_topic=args.sim_image_topic)
+                         sim_image_topic=args.sim_image_topic,
+                         no_save=args.no_save)
     try:
         node.run()
     except KeyboardInterrupt:
@@ -839,14 +848,16 @@ def main():
     finally:
         if not node._log_file.closed:
             node._log_file.close()
-        node._hud_writer.release()
-        print(f'[video] saved → {os.path.join(flight_dir, "combined.mp4")}')
+        if node._hud_writer is not None:
+            node._hud_writer.release()
+            print(f'[video] saved → {os.path.join(flight_dir, "combined.mp4")}')
         node._stop_camera()
         time.sleep(0.5)
         node.destroy_node()
         rclpy.shutdown()
         _plot_flight_log(flight_dir)
-        _make_video(flight_dir)
+        if not args.no_save:
+            _make_video(flight_dir)
         if not args.sim:
             _sync_dropbox(flight_dir, stamp)
 
