@@ -84,6 +84,11 @@ ACTION_MOMENTUM = 0.3
 SMOOTH_ALPHA    = 1.0 - ACTION_MOMENTUM   # 0.7
 RGB_SAVE_EVERY  = 5                       # save raw RGB every N steps (~2 Hz at 10 Hz)
 
+DEPTH_ENGINE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'model',
+    'depth_anything_v2_small_fp16.trt'
+)
+
 # HUD composite video dimensions
 _DISP_W, _DISP_H = 640, 360
 _BAR_H            = 70
@@ -171,6 +176,71 @@ class DepthEstimator:
 
 
 # ---------------------------------------------------------------------------
+# Depth estimator — TensorRT fast path
+# ---------------------------------------------------------------------------
+
+class DepthEstimatorTRT:
+
+    def __init__(self, engine_path: str):
+        print(f'[DepthEstimatorTRT] Loading processor from {DEPTH_MODEL_ID} ...')
+        _proc = AutoImageProcessor.from_pretrained(DEPTH_MODEL_ID)
+        self._mean = np.array(_proc.image_mean, dtype=np.float32)
+        self._std  = np.array(_proc.image_std,  dtype=np.float32)
+
+        print(f'[DepthEstimatorTRT] Loading TRT engine: {engine_path}')
+        logger = trt.Logger(trt.Logger.WARNING)
+        with open(engine_path, 'rb') as f:
+            runtime      = trt.Runtime(logger)
+            self._engine = runtime.deserialize_cuda_engine(f.read())
+        self._context = self._engine.create_execution_context()
+        self._stream  = cuda.Stream()
+
+        self._bindings = {}
+        for i in range(self._engine.num_io_tensors):
+            name  = self._engine.get_tensor_name(i)
+            shape = tuple(self._engine.get_tensor_shape(name))
+            dtype = trt.nptype(self._engine.get_tensor_dtype(name))
+            host  = cuda.pagelocked_empty(shape, dtype)
+            dev   = cuda.mem_alloc(host.nbytes)
+            self._bindings[name] = {
+                'shape': shape, 'dtype': dtype, 'host': host, 'dev': dev
+            }
+            self._context.set_tensor_address(name, int(dev))
+
+        _, _, self._in_h, self._in_w = self._bindings['pixel_values']['shape']
+        print(f'[DepthEstimatorTRT] Input: {self._in_h}×{self._in_w}  Ready.')
+
+    def _preprocess(self, bgr: np.ndarray) -> np.ndarray:
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        rgb = cv2.resize(rgb, (self._in_w, self._in_h),
+                         interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+        rgb = (rgb - self._mean) / self._std
+        return rgb.transpose(2, 0, 1)[np.newaxis]
+
+    def estimate(self, bgr: np.ndarray) -> np.ndarray:
+        pixel_values = self._preprocess(bgr)
+
+        pv  = self._bindings['pixel_values']
+        out = self._bindings['predicted_depth']
+
+        np.copyto(pv['host'], pixel_values.reshape(pv['shape']).astype(pv['dtype']))
+        cuda.memcpy_htod_async(pv['dev'],  pv['host'],  self._stream)
+        self._context.execute_async_v3(self._stream.handle)
+        cuda.memcpy_dtoh_async(out['host'], out['dev'], self._stream)
+        self._stream.synchronize()
+
+        depth = out['host'].squeeze().copy()
+        depth = cv2.resize(depth.astype(np.float32), (IMG_W, IMG_H),
+                           interpolation=cv2.INTER_LINEAR)
+        d_min, d_max = float(depth.min()), float(depth.max())
+        if d_max > d_min:
+            depth = (depth - d_min) / (d_max - d_min)
+        else:
+            depth = np.zeros_like(depth)
+        return depth.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # ROS 2 node
 # ---------------------------------------------------------------------------
 
@@ -216,9 +286,17 @@ class FreeriderNode(Node):
         self.land_client = self.create_client(CommandTOL,  '/mavros/cmd/land')
         self.vel_pub     = self.create_publisher(TwistStamped, '/mavros/setpoint_velocity/cmd_vel', 10)
 
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self._depth = DepthEstimator(device=device)
-        self._trt   = TRTEngine(engine_path)
+        if os.path.exists(DEPTH_ENGINE_PATH):
+            self.get_logger().info(f'[Freerider] Depth TRT: {DEPTH_ENGINE_PATH}')
+            self._depth = DepthEstimatorTRT(DEPTH_ENGINE_PATH)
+        else:
+            self.get_logger().warn(
+                f'[Freerider] Depth TRT engine not found — using HuggingFace (~700ms/step). '
+                f'Run export_depth_trt.py to build it.'
+            )
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self._depth = DepthEstimator(device=device)
+        self._trt = TRTEngine(engine_path)
         self.get_logger().info(f'[Freerider] Engine loaded: {engine_path}')
 
         log_path         = os.path.join(flight_dir, 'flight.csv')
@@ -758,6 +836,7 @@ def main():
         if not node._log_file.closed:
             node._log_file.close()
         node._hud_writer.release()
+        print(f'[video] saved → {os.path.join(flight_dir, "combined.mp4")}')
         node._stop_camera()
         time.sleep(0.5)
         node.destroy_node()
