@@ -27,6 +27,7 @@ Usage:
 """
 
 import argparse
+import atexit
 import csv
 import os
 import select
@@ -51,6 +52,7 @@ import pycuda.driver as cuda
 cuda.init()
 _pycuda_ctx = cuda.Device(torch.cuda.current_device()).retain_primary_context()
 _pycuda_ctx.push()
+atexit.register(_pycuda_ctx.pop)
 
 import rclpy
 from cv_bridge import CvBridge

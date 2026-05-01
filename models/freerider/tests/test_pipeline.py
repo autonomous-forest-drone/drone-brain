@@ -36,6 +36,7 @@ torch.cuda.init()  # create PyTorch primary CUDA context first
 # its own CUDA kernels instead. Still runs on GPU, just without cuDNN.
 torch.backends.cudnn.enabled = False
 
+import atexit
 import cv2
 import numpy as np
 import pycuda.driver as cuda
@@ -44,6 +45,7 @@ import pycuda.driver as cuda
 cuda.init()
 _pycuda_ctx = cuda.Device(torch.cuda.current_device()).retain_primary_context()
 _pycuda_ctx.push()
+atexit.register(_pycuda_ctx.pop)  # keep the context stack clean on exit
 
 import tensorrt as trt
 from PIL import Image as PILImage
