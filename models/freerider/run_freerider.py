@@ -82,7 +82,7 @@ FIXED_SPEED     = 1.0
 MAX_LATERAL     = 0.8
 ACTION_MOMENTUM = 0.3
 SMOOTH_ALPHA    = 1.0 - ACTION_MOMENTUM   # 0.7
-RGB_SAVE_EVERY  = 5                       # save raw RGB every N steps (~2 Hz at 10 Hz)
+RGB_SAVE_EVERY  = 1                       # save every frame
 
 DEPTH_ENGINE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'model',
