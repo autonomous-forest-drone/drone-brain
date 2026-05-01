@@ -434,10 +434,6 @@ def main():
         default=ENGINE_PATH,
         help='Path to TensorRT engine (.trt)',
     )
-    parser.add_argument(
-        '--display', action='store_true',
-        help='Show live HUD window (requires a connected display)',
-    )
     args = parser.parse_args()
 
     stamp      = time.strftime('%Y-%m-%d_%H-%M-%S')
@@ -542,10 +538,6 @@ def main():
                 hud = _draw_hud(bgr, depth, raw_action, smoothed,
                                 fwd, lat, step_count, step_latency_ms)
                 hud_writer.write(hud)
-                if args.display:
-                    cv2.imshow('Freerider — Pipeline Test', hud)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        raise KeyboardInterrupt
 
                 elapsed   = time.monotonic() - t_step
                 sleep_for = (1.0 / SETPOINT_HZ) - elapsed
@@ -557,8 +549,6 @@ def main():
         finally:
             log_file.close()
             hud_writer.release()
-            if args.display:
-                cv2.destroyAllWindows()
 
     if latencies:
         print(
