@@ -84,6 +84,10 @@ ACTION_MOMENTUM = 0.3
 SMOOTH_ALPHA    = 1.0 - ACTION_MOMENTUM   # 0.7
 RGB_SAVE_EVERY  = 5                       # save raw RGB every N steps (~2 Hz at 10 Hz)
 
+# HUD composite video dimensions
+_DISP_W, _DISP_H = 640, 360
+_BAR_H            = 70
+
 _CMD_INTERVAL     = 2.0
 _ARM_TIMEOUT      = 30.0
 _TAKEOFF_TIMEOUT  = 30.0
@@ -224,6 +228,14 @@ class FreeriderNode(Node):
             't', 'raw_action', 'smoothed_action',
             'forward_vel', 'lateral_vel', 'step_latency_ms',
         ])
+
+        hud_path         = os.path.join(flight_dir, 'combined.mp4')
+        self._hud_writer = cv2.VideoWriter(
+            hud_path,
+            cv2.VideoWriter_fourcc(*'mp4v'),
+            SETPOINT_HZ,
+            (_DISP_W * 2, _DISP_H + _BAR_H),
+        )
 
     # ------------------------------------------------------------------
     # ROS callbacks
@@ -428,6 +440,10 @@ class FreeriderNode(Node):
             (depth * 255).astype(np.uint8),
         )
 
+        hud = _draw_hud(bgr, depth, raw_action, new_smoothed,
+                        fwd, lat, self._step_count, step_latency_ms)
+        self._hud_writer.write(hud)
+
         return frame_stack, raw_action, new_smoothed, fwd, lat, step_latency_ms
 
     # ------------------------------------------------------------------
@@ -591,6 +607,55 @@ def _plot_flight_log(flight_dir: str):
 
 
 # ---------------------------------------------------------------------------
+# HUD composite frame
+# ---------------------------------------------------------------------------
+
+def _draw_hud(bgr: np.ndarray,
+              depth: np.ndarray,
+              raw_action: float,
+              smoothed: float,
+              fwd: float,
+              lat: float,
+              step: int,
+              latency_ms: float) -> np.ndarray:
+    W, H, BH = _DISP_W, _DISP_H, _BAR_H
+
+    cam = cv2.resize(bgr, (W, H), interpolation=cv2.INTER_LINEAR)
+    cx = W // 2
+    tip_x = cx + int(smoothed * W * 0.40)
+    tip_y = H // 3
+    base_y = H - 20
+    mag = abs(smoothed)
+    arrow_color = (0, 220, 0) if mag < 0.3 else (0, 200, 220) if mag < 0.6 else (0, 60, 230)
+    cv2.arrowedLine(cam, (cx, base_y), (tip_x, tip_y), arrow_color, 3, tipLength=0.25)
+    cv2.putText(cam, f'step {step:06d}', (8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+
+    depth_u8  = (depth * 255).astype(np.uint8)
+    depth_pan = cv2.resize(cv2.applyColorMap(depth_u8, cv2.COLORMAP_INFERNO), (W, H))
+    cv2.putText(depth_pan, 'depth', (8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+
+    bar = np.full((BH, W * 2, 3), 30, dtype=np.uint8)
+    bar_cx = W
+    bar_y0, bar_y1 = 12, 38
+    bar_max_half = W - 40
+    cv2.rectangle(bar, (bar_cx - bar_max_half, bar_y0),
+                       (bar_cx + bar_max_half, bar_y1), (70, 70, 70), -1)
+    fill_w = int(abs(smoothed) * bar_max_half)
+    fill_color = (50, 180, 50) if smoothed >= 0 else (50, 50, 200)
+    x0 = bar_cx if smoothed >= 0 else bar_cx - fill_w
+    cv2.rectangle(bar, (x0, bar_y0), (x0 + fill_w, bar_y1), fill_color, -1)
+    cv2.line(bar, (bar_cx, bar_y0 - 2), (bar_cx, bar_y1 + 2), (200, 200, 200), 2)
+    txt = (f'raw={raw_action:+.3f}  smooth={smoothed:+.3f}  '
+           f'fwd={fwd:.3f}  lat={lat:+.3f}  {latency_ms:.0f}ms')
+    cv2.putText(bar, txt, (10, BH - 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1, cv2.LINE_AA)
+
+    return np.vstack([np.hstack([cam, depth_pan]), bar])
+
+
+# ---------------------------------------------------------------------------
 # Video export
 # ---------------------------------------------------------------------------
 
@@ -692,6 +757,7 @@ def main():
     finally:
         if not node._log_file.closed:
             node._log_file.close()
+        node._hud_writer.release()
         node._stop_camera()
         time.sleep(0.5)
         node.destroy_node()
