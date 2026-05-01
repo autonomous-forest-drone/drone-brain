@@ -481,10 +481,11 @@ def main():
         (_DISP_W * 2, _DISP_H + _BAR_H),
     )
 
-    frame_stack = deque(maxlen=N_FRAMES)
-    smoothed    = 0.0
-    step_count  = 0
-    latencies   = []
+    frame_stack       = deque(maxlen=N_FRAMES)
+    smoothed          = 0.0
+    accumulated_state = 0.0   # running sum of smoothed actions — state input to actor
+    step_count        = 0
+    latencies         = []
     t0          = time.monotonic()
 
     with Camera() as cam:
@@ -502,10 +503,11 @@ def main():
                 while len(frame_stack) < N_FRAMES:
                     frame_stack.appendleft(frame_stack[0])
 
-                image_np   = np.stack(list(frame_stack), axis=0)
-                state_np   = np.array([smoothed], dtype=np.float32)
-                raw_action = float(np.clip(trt_engine.infer(image_np, state_np), -1.0, 1.0))
-                smoothed   = SMOOTH_ALPHA * raw_action + ACTION_MOMENTUM * smoothed
+                image_np          = np.stack(list(frame_stack), axis=0)
+                state_np          = np.array([accumulated_state], dtype=np.float32)
+                raw_action        = float(np.clip(trt_engine.infer(image_np, state_np), -1.0, 1.0))
+                smoothed          = SMOOTH_ALPHA * raw_action + ACTION_MOMENTUM * smoothed
+                accumulated_state += smoothed
 
                 fwd = FIXED_SPEED - MAX_LATERAL * abs(smoothed)
                 lat = MAX_LATERAL * smoothed

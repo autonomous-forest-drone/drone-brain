@@ -482,10 +482,11 @@ class FreeriderNode(Node):
     # One policy step
     # ------------------------------------------------------------------
 
-    def _avoidance_step(self, frame_stack: deque, smoothed_action: float, t0: float):
+    def _avoidance_step(self, frame_stack: deque, smoothed_action: float,
+                        accumulated_state: float, t0: float):
         bgr = self._get_frame()
         if bgr is None:
-            return frame_stack, smoothed_action, smoothed_action, 0.0, 0.0, 0.0
+            return frame_stack, smoothed_action, accumulated_state, 0.0, 0.0, 0.0
 
         t_step_start = time.monotonic()
 
@@ -494,11 +495,12 @@ class FreeriderNode(Node):
         while len(frame_stack) < N_FRAMES:
             frame_stack.appendleft(frame_stack[0])
 
-        image_np = np.stack(list(frame_stack), axis=0)
-        state_np = np.array([smoothed_action], dtype=np.float32)
+        image_np          = np.stack(list(frame_stack), axis=0)
+        state_np          = np.array([accumulated_state], dtype=np.float32)
 
-        raw_action   = float(np.clip(self._trt.infer(image_np, state_np), -1.0, 1.0))
-        new_smoothed = SMOOTH_ALPHA * raw_action + ACTION_MOMENTUM * smoothed_action
+        raw_action        = float(np.clip(self._trt.infer(image_np, state_np), -1.0, 1.0))
+        new_smoothed      = SMOOTH_ALPHA * raw_action + ACTION_MOMENTUM * smoothed_action
+        new_accumulated   = accumulated_state + new_smoothed
 
         fwd = FIXED_SPEED - MAX_LATERAL * abs(new_smoothed)
         lat = MAX_LATERAL * new_smoothed
@@ -517,7 +519,7 @@ class FreeriderNode(Node):
         stamp = f'{self._step_count:06d}'
         print(
             f'  [{stamp}]  raw={raw_action:+.3f}  smooth={new_smoothed:+.3f}  '
-            f'fwd={fwd:.3f}  lat={lat:+.3f}  {step_latency_ms:.0f}ms'
+            f'acc={new_accumulated:+.2f}  fwd={fwd:.3f}  lat={lat:+.3f}  {step_latency_ms:.0f}ms'
         )
         if not self._no_save:
             if self._step_count % RGB_SAVE_EVERY == 0:
@@ -532,7 +534,7 @@ class FreeriderNode(Node):
                             fwd, lat, self._step_count, step_latency_ms)
             self._hud_writer.write(hud)
 
-        return frame_stack, raw_action, new_smoothed, fwd, lat, step_latency_ms
+        return frame_stack, raw_action, new_smoothed, new_accumulated, fwd, lat, step_latency_ms
 
     # ------------------------------------------------------------------
     # Main run sequence
@@ -601,10 +603,11 @@ class FreeriderNode(Node):
             self.get_logger().error('Failed to enter OFFBOARD — aborting.')
             return
 
-        latencies   = []
-        frame_stack = deque(maxlen=N_FRAMES)
-        smoothed    = 0.0
-        t0          = time.monotonic()
+        latencies         = []
+        frame_stack       = deque(maxlen=N_FRAMES)
+        smoothed          = 0.0
+        accumulated_state = 0.0   # running sum of smoothed actions — state input to actor
+        t0                = time.monotonic()
 
         self.get_logger().info('Freerider avoidance active. RC override to exit.')
         try:
@@ -616,8 +619,8 @@ class FreeriderNode(Node):
                 if not self.state.armed:
                     self.get_logger().info('Disarmed — stopping.')
                     break
-                frame_stack, raw, smoothed, fwd, lat, latency_ms = self._avoidance_step(
-                    frame_stack, smoothed, t0,
+                frame_stack, raw, smoothed, accumulated_state, fwd, lat, latency_ms = self._avoidance_step(
+                    frame_stack, smoothed, accumulated_state, t0,
                 )
                 if latency_ms > 0.0:
                     latencies.append(latency_ms)
