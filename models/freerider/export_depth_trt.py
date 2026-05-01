@@ -30,11 +30,12 @@ import torch.nn as nn
 DEPTH_MODEL_ID = 'depth-anything/Depth-Anything-V2-Small-hf'
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model')
 
-# Processor output size for a 1920×1080 camera frame:
-# scales height to 518, preserves aspect ratio, rounds width to multiple of 14 → 924.
-# Override with --input-h / --input-w if your camera resolution differs.
-INPUT_H = 518
-INPUT_W = 924
+# Input size for the TRT engine (must be multiples of 14 — DINOv2 patch stride).
+# 392×700 is 0.75× the native 518×924, giving ~3× fewer attention patches
+# and roughly 10 Hz throughput on Jetson Orin Nano.
+# Use 518×924 for maximum quality (fits 1920×1080 aspect ratio exactly).
+INPUT_H = 392
+INPUT_W = 700
 
 
 class _DepthWrapper(nn.Module):
