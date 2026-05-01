@@ -511,6 +511,10 @@ class FreeriderNode(Node):
 
         self._step_count += 1
         stamp = f'{self._step_count:06d}'
+        print(
+            f'  [{stamp}]  raw={raw_action:+.3f}  smooth={new_smoothed:+.3f}  '
+            f'fwd={fwd:.3f}  lat={lat:+.3f}  {step_latency_ms:.0f}ms'
+        )
         if self._step_count % RGB_SAVE_EVERY == 0:
             cv2.imwrite(os.path.join(self._frames_dir, f'{stamp}.jpg'), bgr)
         cv2.imwrite(
