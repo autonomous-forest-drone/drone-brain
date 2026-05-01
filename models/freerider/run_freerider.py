@@ -41,6 +41,7 @@ from collections import deque
 
 import torch
 torch.cuda.init()  # create PyTorch primary CUDA context first
+torch.backends.cudnn.enabled = False  # cuDNN conflicts with pycuda/TRT on Jetson
 
 import cv2
 import numpy as np
