@@ -68,6 +68,11 @@ ENGINE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), '..', 'model', 'freerider_actor.trt'
 )
 
+DEPTH_ENGINE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'model',
+    'depth_anything_v2_small_fp16.trt'
+)
+
 
 # ---------------------------------------------------------------------------
 # TensorRT inference wrapper (identical to run_freerider.py)
@@ -111,7 +116,7 @@ class TRTEngine:
 
 
 # ---------------------------------------------------------------------------
-# Depth estimator (identical to run_freerider.py)
+# Depth estimator — HuggingFace fallback (slow, ~550 ms/step without cuDNN)
 # ---------------------------------------------------------------------------
 
 class DepthEstimator:
@@ -133,6 +138,69 @@ class DepthEstimator:
             raw = self._model(**inputs).predicted_depth
         depth = raw.squeeze().cpu().numpy()
         depth = cv2.resize(depth, (IMG_W, IMG_H), interpolation=cv2.INTER_LINEAR)
+        d_min, d_max = float(depth.min()), float(depth.max())
+        if d_max > d_min:
+            depth = (depth - d_min) / (d_max - d_min)
+        else:
+            depth = np.zeros_like(depth)
+        return depth.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Depth estimator — TensorRT fast path (~30–80 ms/step target)
+# ---------------------------------------------------------------------------
+
+class DepthEstimatorTRT:
+    """Runs DepthAnything V2 Small via a pre-built TRT engine.
+
+    Preprocessing (resize + normalise) still runs on CPU via AutoImageProcessor
+    (< 2 ms); only the forward pass goes through TRT on the GPU.
+    """
+
+    def __init__(self, engine_path: str):
+        print(f'[DepthEstimatorTRT] Loading processor from {DEPTH_MODEL_ID} ...')
+        self._processor = AutoImageProcessor.from_pretrained(DEPTH_MODEL_ID)
+
+        print(f'[DepthEstimatorTRT] Loading TRT engine: {engine_path}')
+        logger = trt.Logger(trt.Logger.WARNING)
+        with open(engine_path, 'rb') as f:
+            runtime      = trt.Runtime(logger)
+            self._engine = runtime.deserialize_cuda_engine(f.read())
+        self._context = self._engine.create_execution_context()
+        self._stream  = cuda.Stream()
+
+        self._bindings = {}
+        for i in range(self._engine.num_io_tensors):
+            name  = self._engine.get_tensor_name(i)
+            shape = tuple(self._engine.get_tensor_shape(name))
+            dtype = trt.nptype(self._engine.get_tensor_dtype(name))
+            host  = cuda.pagelocked_empty(shape, dtype)
+            dev   = cuda.mem_alloc(host.nbytes)
+            self._bindings[name] = {
+                'shape': shape, 'dtype': dtype, 'host': host, 'dev': dev
+            }
+            self._context.set_tensor_address(name, int(dev))
+
+        print('[DepthEstimatorTRT] Ready.')
+
+    def estimate(self, bgr: np.ndarray) -> np.ndarray:
+        rgb    = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        pil    = PILImage.fromarray(rgb)
+        inputs = self._processor(images=pil, return_tensors='pt')
+        pixel_values = inputs['pixel_values'].numpy()  # [1, 3, H, W]  CPU numpy
+
+        pv  = self._bindings['pixel_values']
+        out = self._bindings['predicted_depth']
+
+        np.copyto(pv['host'], pixel_values.reshape(pv['shape']).astype(pv['dtype']))
+        cuda.memcpy_htod_async(pv['dev'],  pv['host'],  self._stream)
+        self._context.execute_async_v3(self._stream.handle)
+        cuda.memcpy_dtoh_async(out['host'], out['dev'], self._stream)
+        self._stream.synchronize()
+
+        depth = out['host'].squeeze().copy()
+        depth = cv2.resize(depth.astype(np.float32), (IMG_W, IMG_H),
+                           interpolation=cv2.INTER_LINEAR)
         d_min, d_max = float(depth.min()), float(depth.max())
         if d_max > d_min:
             depth = (depth - d_min) / (d_max - d_min)
@@ -248,7 +316,14 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'Device     : {device}')
 
-    depth_est  = DepthEstimator(device=device)
+    if os.path.exists(DEPTH_ENGINE_PATH):
+        print(f'Depth TRT  : {DEPTH_ENGINE_PATH}')
+        depth_est = DepthEstimatorTRT(DEPTH_ENGINE_PATH)
+    else:
+        print(f'Depth TRT  : not found — using HuggingFace model (~550 ms/step)')
+        print(f'             Run export_depth_trt.py to build the engine.')
+        depth_est = DepthEstimator(device=device)
+
     trt_engine = TRTEngine(args.engine)
     print(f'[TRT] Engine loaded: {args.engine}')
 
