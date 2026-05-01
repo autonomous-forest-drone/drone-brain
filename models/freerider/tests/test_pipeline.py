@@ -160,8 +160,12 @@ class DepthEstimatorTRT:
     """
 
     def __init__(self, engine_path: str):
+        # Read normalisation stats from the processor config — don't use the
+        # processor's resize logic (it ignores our target resolution).
         print(f'[DepthEstimatorTRT] Loading processor from {DEPTH_MODEL_ID} ...')
-        self._processor = AutoImageProcessor.from_pretrained(DEPTH_MODEL_ID)
+        _proc = AutoImageProcessor.from_pretrained(DEPTH_MODEL_ID)
+        self._mean = np.array(_proc.image_mean, dtype=np.float32)  # [0.485, 0.456, 0.406]
+        self._std  = np.array(_proc.image_std,  dtype=np.float32)  # [0.229, 0.224, 0.225]
 
         print(f'[DepthEstimatorTRT] Loading TRT engine: {engine_path}')
         logger = trt.Logger(trt.Logger.WARNING)
@@ -183,13 +187,19 @@ class DepthEstimatorTRT:
             }
             self._context.set_tensor_address(name, int(dev))
 
-        print('[DepthEstimatorTRT] Ready.')
+        _, _, self._in_h, self._in_w = self._bindings['pixel_values']['shape']
+        print(f'[DepthEstimatorTRT] Input: {self._in_h}×{self._in_w}  Ready.')
+
+    def _preprocess(self, bgr: np.ndarray) -> np.ndarray:
+        """Resize to engine input size and normalise → float32 NCHW."""
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        rgb = cv2.resize(rgb, (self._in_w, self._in_h),
+                         interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+        rgb = (rgb - self._mean) / self._std          # HWC, float32
+        return rgb.transpose(2, 0, 1)[np.newaxis]     # → NCHW [1,3,H,W]
 
     def estimate(self, bgr: np.ndarray) -> np.ndarray:
-        rgb    = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        pil    = PILImage.fromarray(rgb)
-        inputs = self._processor(images=pil, return_tensors='pt')
-        pixel_values = inputs['pixel_values'].numpy()  # [1, 3, H, W]  CPU numpy
+        pixel_values = self._preprocess(bgr)  # [1, 3, in_h, in_w]
 
         pv  = self._bindings['pixel_values']
         out = self._bindings['predicted_depth']
