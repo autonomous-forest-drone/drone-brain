@@ -57,7 +57,7 @@ atexit.register(_pycuda_ctx.pop)
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import TwistStamped
-from mavros_msgs.msg import State, StatusText
+from mavros_msgs.msg import PlayTuneV2, State, StatusText
 from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
 from nav_msgs.msg import Odometry
 from PIL import Image as PILImage
@@ -288,6 +288,7 @@ class FreeriderNode(Node):
         self.mode_client = self.create_client(SetMode,     '/mavros/set_mode')
         self.land_client = self.create_client(CommandTOL,  '/mavros/cmd/land')
         self.vel_pub     = self.create_publisher(TwistStamped, '/mavros/setpoint_velocity/cmd_vel', 10)
+        self.tune_pub    = self.create_publisher(PlayTuneV2,   '/mavros/play_tune', 10)
 
         if os.path.exists(DEPTH_ENGINE_PATH):
             self.get_logger().info(f'[Freerider] Depth TRT: {DEPTH_ENGINE_PATH}')
@@ -369,6 +370,13 @@ class FreeriderNode(Node):
         msg.twist.linear.y  = vx * np.sin(yaw) + vy * np.cos(yaw)
         msg.twist.linear.z  = vz
         self.vel_pub.publish(msg)
+
+    def _play_tune(self, tune: str):
+        """Play a tune on the PX4 buzzer via MAVROS (QB MML format)."""
+        msg = PlayTuneV2()
+        msg.format = 1   # QBasic 1.1 Music Macro Language
+        msg.tune   = tune
+        self.tune_pub.publish(msg)
 
     # ------------------------------------------------------------------
     # Camera
@@ -605,18 +613,7 @@ class FreeriderNode(Node):
             rclpy.spin_once(self, timeout_sec=0.1)
 
         self.get_logger().info(f'Takeoff complete (now in {self.state.mode}).')
-
-        # Let altitude settle for a few seconds before we lock in the target.
-        # AUTO.TAKEOFF may overshoot slightly; this gives the controller time to stabilize.
-        self.get_logger().info('Waiting for altitude to stabilize...')
-        stabilize_deadline = time.monotonic() + 3.0
-        while time.monotonic() < stabilize_deadline:
-            if self._rc_override():
-                self.get_logger().info('RC override during stabilization — aborting.')
-                return
-            rclpy.spin_once(self, timeout_sec=0.1)
-        self.get_logger().info(f'Altitude stable at {self._alt:.2f} m')
-
+        self._play_tune('MFT240L8 O4 CEG')   # ascending 3-note: takeoff done
         self._start_camera()
 
         result = self._switch_offboard()
@@ -628,6 +625,7 @@ class FreeriderNode(Node):
         # The altitude P-controller in _avoidance_step will hold this throughout the flight.
         self._target_alt = self._alt
         self.get_logger().info(f'OFFBOARD target altitude locked: {self._target_alt:.2f} m')
+        self._play_tune('MFT240L8 O5 CC')    # two quick high beeps: OFFBOARD active
 
         latencies         = []
         frame_stack       = deque(maxlen=N_FRAMES)
@@ -641,6 +639,7 @@ class FreeriderNode(Node):
                 rclpy.spin_once(self, timeout_sec=dt)
                 if self._rc_override():
                     self.get_logger().info('RC override detected — stopping.')
+                    self._play_tune('MFT240L8 O4 GEC')   # descending: RC override / stopping
                     break
                 if not self.state.armed:
                     self.get_logger().info('Disarmed — stopping.')
