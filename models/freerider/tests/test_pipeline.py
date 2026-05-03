@@ -525,7 +525,14 @@ def main():
 
                 now = time.monotonic()
                 if now - last_beep >= 2.0:
-                    print('\a', end='', flush=True)
+                    subprocess.Popen(
+                        ['ros2', 'topic', 'pub', '--once',
+                         '/mavros/play_tune',
+                         'mavros_msgs/msg/PlayTuneV2',
+                         '{format: 1, tune: "MFT240L8 O5 CC"}'],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
                     last_beep = now
 
                 step_count += 1
