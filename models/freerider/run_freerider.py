@@ -308,7 +308,7 @@ class FreeriderNode(Node):
         self._log_writer = csv.writer(self._log_file)
         self._log_writer.writerow([
             't', 'raw_action', 'smoothed_action',
-            'forward_vel', 'lateral_vel', 'step_latency_ms',
+            'forward_vel', 'lateral_vel', 'alt_m', 'vz_cmd', 'step_latency_ms',
         ])
 
         if not no_save:
@@ -375,7 +375,7 @@ class FreeriderNode(Node):
         msg.type_mask        = self._TYPE_MASK
         msg.velocity.x       = vx
         msg.velocity.y       = vy    # NED y=right, training vy=right — no negation
-        msg.velocity.z       = -vz   # NED z=down, our vz=up
+        msg.velocity.z       = vz    # MAVROS flips z internally, so no negation here
         self.vel_pub.publish(msg)
 
     def _play_tune(self, tune: str):
@@ -534,7 +534,7 @@ class FreeriderNode(Node):
 
         self._log_writer.writerow([
             f'{t:.3f}', f'{raw_action:.4f}', f'{new_smoothed:.4f}',
-            f'{fwd:.4f}', f'{lat:.4f}', f'{step_latency_ms:.1f}',
+            f'{fwd:.4f}', f'{lat:.4f}', f'{self._alt:.3f}', f'{vz:.3f}', f'{step_latency_ms:.1f}',
         ])
         self._log_file.flush()
 
@@ -542,7 +542,8 @@ class FreeriderNode(Node):
         stamp = f'{self._step_count:06d}'
         print(
             f'  [{stamp}]  raw={raw_action:+.3f}  smooth={new_smoothed:+.3f}  '
-            f'acc={new_accumulated:+.2f}  fwd={fwd:.3f}  lat={lat:+.3f}  {step_latency_ms:.0f}ms'
+            f'acc={new_accumulated:+.2f}  fwd={fwd:.3f}  lat={lat:+.3f}  '
+            f'alt={self._alt:.2f}m  vz={vz:+.3f}  {step_latency_ms:.0f}ms'
         )
         if not self._no_save:
             if self._step_count % RGB_SAVE_EVERY == 0:
@@ -687,7 +688,7 @@ def _plot_flight_log(flight_dir: str):
     if not os.path.exists(csv_path):
         return
 
-    t, raw, smoothed, fwd, lat, latency = [], [], [], [], [], []
+    t, raw, smoothed, fwd, lat, alt, vz_cmd, latency = [], [], [], [], [], [], [], []
     with open(csv_path) as f:
         for row in csv.DictReader(f):
             t.append(float(row['t']))
@@ -695,12 +696,14 @@ def _plot_flight_log(flight_dir: str):
             smoothed.append(float(row['smoothed_action']))
             fwd.append(float(row['forward_vel']))
             lat.append(float(row['lateral_vel']))
+            alt.append(float(row.get('alt_m', 0)))
+            vz_cmd.append(float(row.get('vz_cmd', 0)))
             latency.append(float(row['step_latency_ms']))
 
     if not t:
         return
 
-    fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(12, 13), sharex=True)
     fig.suptitle(os.path.basename(flight_dir))
 
     axes[0].plot(t, raw,      color='steelblue', label='raw action')
@@ -721,10 +724,16 @@ def _plot_flight_log(flight_dir: str):
     axes[2].set_ylabel('Velocity (m/s)')
     axes[2].legend()
 
-    axes[3].plot(t, latency, color='purple', label='step latency (ms)')
-    axes[3].set_ylabel('Latency (ms)')
-    axes[3].set_xlabel('Time (s)')
+    axes[3].plot(t, alt,    color='teal',   label='altitude (m)')
+    axes[3].plot(t, vz_cmd, color='salmon', label='vz cmd (m/s)')
+    axes[3].axhline(0, color='gray', linewidth=0.5)
+    axes[3].set_ylabel('Altitude / vz')
     axes[3].legend()
+
+    axes[4].plot(t, latency, color='purple', label='step latency (ms)')
+    axes[4].set_ylabel('Latency (ms)')
+    axes[4].set_xlabel('Time (s)')
+    axes[4].legend()
 
     plt.tight_layout()
     out = os.path.join(flight_dir, 'flight.png')

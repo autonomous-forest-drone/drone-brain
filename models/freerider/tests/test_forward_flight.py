@@ -130,7 +130,7 @@ class ForwardFlightNode(Node):
         msg.type_mask        = self._TYPE_MASK
         msg.velocity.x       = vx
         msg.velocity.y       = vy    # NED y=right, training vy=right — no negation
-        msg.velocity.z       = -vz   # NED z=down, our vz=up
+        msg.velocity.z       = vz    # MAVROS flips z internally, so no negation here
         self.vel_pub.publish(msg)
 
     def _play_tune(self, tune: str):
