@@ -366,15 +366,15 @@ class FreeriderNode(Node):
 
     def _publish_vel(self, vx: float = 0.0, vy: float = 0.0, vz: float = 0.0):
         """Publish velocity in body frame (FRAME_BODY_NED).
-        vx=forward, vy=left (positive left), vz=up (positive up).
-        NED convention: y=right, z=down — so vy and vz are negated.
+        vx=forward, vy=right (positive right, matches training convention), vz=up (positive up).
+        NED convention: z=down — so vz is negated. vy matches NED y=right directly.
         """
         msg = PositionTarget()
         msg.header.stamp     = self.get_clock().now().to_msg()
         msg.coordinate_frame = PositionTarget.FRAME_BODY_NED
         msg.type_mask        = self._TYPE_MASK
         msg.velocity.x       = vx
-        msg.velocity.y       = -vy   # NED y=right, our vy=left
+        msg.velocity.y       = vy    # NED y=right, training vy=right — no negation
         msg.velocity.z       = -vz   # NED z=down, our vz=up
         self.vel_pub.publish(msg)
 
@@ -520,7 +520,7 @@ class FreeriderNode(Node):
         new_smoothed      = SMOOTH_ALPHA * raw_action + ACTION_MOMENTUM * smoothed_action
         new_accumulated   = accumulated_state + new_smoothed
 
-        fwd = FIXED_SPEED - MAX_LATERAL * abs(new_smoothed)
+        fwd = max(0.0, FIXED_SPEED - MAX_LATERAL * abs(new_smoothed))
         lat = MAX_LATERAL * new_smoothed
         if self._alt_hold and self._target_alt is not None:
             alt_err = self._target_alt - self._alt
