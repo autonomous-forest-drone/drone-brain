@@ -44,7 +44,6 @@ SETPOINT_HZ     = 10
 PRESTREAM_TIME  = 2.0
 FORWARD_SPEED   = 0.6    # m/s — same as FIXED_SPEED in run_freerider
 FORWARD_TIME    = 5.0    # seconds of straight forward flight before landing
-TARGET_ALT      = 1.5   # m — altitude P-controller setpoint
 
 _CMD_INTERVAL     = 2.0
 _ARM_TIMEOUT      = 30.0
@@ -67,6 +66,7 @@ class ForwardFlightNode(Node):
         self.state          = State()
         self._left_rc_modes = False
         self._alt           = 0.0
+        self._target_alt    = 0.0
 
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         state_qos = QoSProfile(
@@ -269,7 +269,11 @@ class ForwardFlightNode(Node):
                 return
             rclpy.spin_once(self, timeout_sec=0.1)
 
-        self.get_logger().info(f'Takeoff complete (now in {self.state.mode}).')
+        self._target_alt = self._alt
+        self.get_logger().info(
+            f'Takeoff complete (now in {self.state.mode}). '
+            f'Altitude locked: {self._target_alt:.2f} m'
+        )
         self._play_tune('MFT120L4 O6 CEG')   # ascending: takeoff done
 
         result = self._switch_offboard()
@@ -279,13 +283,13 @@ class ForwardFlightNode(Node):
 
         self.get_logger().info(
             f'OFFBOARD active. Flying forward {FORWARD_SPEED} m/s '
-            f'for {FORWARD_TIME:.0f}s. Target alt: {TARGET_ALT:.1f} m'
+            f'for {FORWARD_TIME:.0f}s. Target alt: {self._target_alt:.2f} m'
         )
         self._play_tune('MFT120L4 O6 CCC')   # three beeps: OFFBOARD active
 
         deadline = time.monotonic() + FORWARD_TIME
         while time.monotonic() < deadline:
-            alt_err = TARGET_ALT - self._alt
+            alt_err = self._target_alt - self._alt
             vz = float(np.clip(1.0 * alt_err, -0.5, 0.5))
             self._publish_vel(vx=FORWARD_SPEED, vz=vz)
             rclpy.spin_once(self, timeout_sec=dt)
@@ -326,7 +330,7 @@ def main():
     print('Freerider — Forward Flight Test')
     print(f'  Forward speed : {FORWARD_SPEED} m/s')
     print(f'  Forward time  : {FORWARD_TIME:.0f} s  (~{FORWARD_SPEED * FORWARD_TIME:.1f} m)')
-    print(f'  Target alt    : {TARGET_ALT:.1f} m')
+    print(f'  Target alt    : captured from AUTO.TAKEOFF')
     print('  RC override   : switch to ALTCTL or POSCTL at any time')
     print('=' * 60)
 

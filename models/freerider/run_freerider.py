@@ -606,7 +606,11 @@ class FreeriderNode(Node):
                 return
             rclpy.spin_once(self, timeout_sec=0.1)
 
-        self.get_logger().info(f'Takeoff complete (now in {self.state.mode}).')
+        self._target_alt = self._alt
+        self.get_logger().info(
+            f'Takeoff complete (now in {self.state.mode}). '
+            f'Altitude locked: {self._target_alt:.2f} m'
+        )
         self._play_tune('MFT120L4 O6 CEG')   # ascending 3-note: takeoff done
         self._start_camera()
 
