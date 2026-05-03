@@ -260,6 +260,7 @@ class FreeriderNode(Node):
 
         self.state          = State()
         self._left_rc_modes = False
+        self._yaw           = 0.0
         self._alt           = 0.0    # altitude from odometry (ENU, metres above home)
         self._target_alt    = None   # set after offboard entry; P controller holds this altitude
         self._latest_bgr    = None   # used in sim mode only
@@ -332,6 +333,10 @@ class FreeriderNode(Node):
         self.get_logger().info(f'[PX4] {msg.text}')
 
     def _on_odom(self, msg):
+        q = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self._yaw = np.arctan2(siny_cosp, cosy_cosp)
         self._alt = msg.pose.pose.position.z
 
     def _on_sim_image(self, msg):
@@ -357,11 +362,12 @@ class FreeriderNode(Node):
     # ------------------------------------------------------------------
 
     def _publish_vel(self, vx: float = 0.0, vy: float = 0.0, vz: float = 0.0):
+        yaw = self._yaw
         msg = TwistStamped()
         msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_link'
-        msg.twist.linear.x  = vx
-        msg.twist.linear.y  = vy
+        msg.header.frame_id = 'map'
+        msg.twist.linear.x  = vx * np.cos(yaw) - vy * np.sin(yaw)
+        msg.twist.linear.y  = vx * np.sin(yaw) + vy * np.cos(yaw)
         msg.twist.linear.z  = vz
         self.vel_pub.publish(msg)
 
@@ -619,8 +625,6 @@ class FreeriderNode(Node):
             self.get_logger().error('Failed to enter OFFBOARD — aborting.')
             return
 
-        self._target_alt = 1.5
-        self.get_logger().info(f'OFFBOARD target altitude: {self._target_alt:.2f} m')
         self._play_tune('MFT120L4 O6 CCC')   # three beeps: OFFBOARD active
 
         latencies         = []

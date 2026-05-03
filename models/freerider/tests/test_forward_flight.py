@@ -44,6 +44,8 @@ SETPOINT_HZ     = 10
 PRESTREAM_TIME  = 2.0
 FORWARD_SPEED   = 0.6    # m/s — same as FIXED_SPEED in run_freerider
 FORWARD_TIME    = 5.0    # seconds of straight forward flight before landing
+ALT_HOLD_GAIN   = 1.0    # P gain (m/s per m error)
+ALT_HOLD_MAX_VZ = 0.5    # max vertical correction (m/s)
 
 _CMD_INTERVAL     = 2.0
 _ARM_TIMEOUT      = 30.0
@@ -59,12 +61,14 @@ SIM_FCU_URL       = 'udp://:14540@194.47.28.91:14580'
 
 class ForwardFlightNode(Node):
 
-    def __init__(self, sim: bool = False):
+    def __init__(self, sim: bool = False, alt_hold: bool = False):
         super().__init__('forward_flight_test')
 
         self._sim           = sim
+        self._alt_hold      = alt_hold
         self.state          = State()
         self._left_rc_modes = False
+        self._yaw           = 0.0
         self._alt           = 0.0
         self._target_alt    = 0.0
 
@@ -95,6 +99,10 @@ class ForwardFlightNode(Node):
         self.get_logger().info(f'[PX4] {msg.text}')
 
     def _on_odom(self, msg):
+        q = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self._yaw = np.arctan2(siny_cosp, cosy_cosp)
         self._alt = msg.pose.pose.position.z
 
     # ------------------------------------------------------------------
@@ -112,11 +120,12 @@ class ForwardFlightNode(Node):
     # ------------------------------------------------------------------
 
     def _publish_vel(self, vx: float = 0.0, vy: float = 0.0, vz: float = 0.0):
+        yaw = self._yaw
         msg = TwistStamped()
         msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_link'
-        msg.twist.linear.x  = vx
-        msg.twist.linear.y  = vy
+        msg.header.frame_id = 'map'
+        msg.twist.linear.x  = vx * np.cos(yaw) - vy * np.sin(yaw)
+        msg.twist.linear.y  = vx * np.sin(yaw) + vy * np.cos(yaw)
         msg.twist.linear.z  = vz
         self.vel_pub.publish(msg)
 
@@ -269,11 +278,17 @@ class ForwardFlightNode(Node):
                 return
             rclpy.spin_once(self, timeout_sec=0.1)
 
-        self._target_alt = self._alt
-        self.get_logger().info(
-            f'Takeoff complete (now in {self.state.mode}). '
-            f'Altitude locked: {self._target_alt:.2f} m'
-        )
+        if self._alt_hold:
+            # Wait for a valid altitude reading before locking target
+            while self._alt < 0.3:
+                rclpy.spin_once(self, timeout_sec=0.05)
+            self._target_alt = self._alt
+            self.get_logger().info(
+                f'Takeoff complete (now in {self.state.mode}). '
+                f'Altitude locked: {self._target_alt:.2f} m'
+            )
+        else:
+            self.get_logger().info(f'Takeoff complete (now in {self.state.mode}).')
         self._play_tune('MFT120L4 O6 CEG')   # ascending: takeoff done
 
         result = self._switch_offboard()
@@ -281,16 +296,20 @@ class ForwardFlightNode(Node):
             self.get_logger().error('Failed to enter OFFBOARD — aborting.')
             return
 
+        alt_info = f'Target alt: {self._target_alt:.2f} m' if self._alt_hold else 'PX4 alt hold'
         self.get_logger().info(
             f'OFFBOARD active. Flying forward {FORWARD_SPEED} m/s '
-            f'for {FORWARD_TIME:.0f}s. Target alt: {self._target_alt:.2f} m'
+            f'for {FORWARD_TIME:.0f}s. {alt_info}'
         )
         self._play_tune('MFT120L4 O6 CCC')   # three beeps: OFFBOARD active
 
         deadline = time.monotonic() + FORWARD_TIME
         while time.monotonic() < deadline:
-            alt_err = self._target_alt - self._alt
-            vz = float(np.clip(1.0 * alt_err, -0.5, 0.5))
+            if self._alt_hold:
+                alt_err = self._target_alt - self._alt
+                vz = float(np.clip(ALT_HOLD_GAIN * alt_err, -ALT_HOLD_MAX_VZ, ALT_HOLD_MAX_VZ))
+            else:
+                vz = 0.0
             self._publish_vel(vx=FORWARD_SPEED, vz=vz)
             rclpy.spin_once(self, timeout_sec=dt)
 
@@ -323,19 +342,21 @@ class ForwardFlightNode(Node):
 
 def main():
     parser = argparse.ArgumentParser(description='Freerider forward flight test')
-    parser.add_argument('--sim', action='store_true', help='Simulation mode')
+    parser.add_argument('--sim',      action='store_true', help='Simulation mode')
+    parser.add_argument('--alt-hold', action='store_true',
+                        help='Enable software altitude P-controller (default: rely on PX4)')
     args = parser.parse_args()
 
     print('=' * 60)
     print('Freerider — Forward Flight Test')
     print(f'  Forward speed : {FORWARD_SPEED} m/s')
     print(f'  Forward time  : {FORWARD_TIME:.0f} s  (~{FORWARD_SPEED * FORWARD_TIME:.1f} m)')
-    print(f'  Target alt    : captured from AUTO.TAKEOFF')
+    print(f'  Alt hold      : {"software P-controller" if args.alt_hold else "PX4 default"}')
     print('  RC override   : switch to ALTCTL or POSCTL at any time')
     print('=' * 60)
 
     rclpy.init()
-    node = ForwardFlightNode(sim=args.sim)
+    node = ForwardFlightNode(sim=args.sim, alt_hold=args.alt_hold)
     try:
         node.run()
     except KeyboardInterrupt:
