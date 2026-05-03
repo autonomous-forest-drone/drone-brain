@@ -261,6 +261,8 @@ class FreeriderNode(Node):
         self.state          = State()
         self._left_rc_modes = False
         self._yaw           = 0.0
+        self._alt           = 0.0    # altitude from odometry (ENU, metres above home)
+        self._target_alt    = None   # set after offboard entry; P controller holds this altitude
         self._latest_bgr    = None   # used in sim mode only
         self._frame_lock    = threading.Lock()
         self._camera        = None   # Camera instance (real hardware)
@@ -334,6 +336,7 @@ class FreeriderNode(Node):
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self._yaw = np.arctan2(siny_cosp, cosy_cosp)
+        self._alt = msg.pose.pose.position.z
 
     def _on_sim_image(self, msg):
         try:
@@ -499,13 +502,18 @@ class FreeriderNode(Node):
         state_np          = np.array([accumulated_state], dtype=np.float32)
 
         raw_action        = float(np.clip(self._trt.infer(image_np, state_np), -1.0, 1.0))
-        # new_smoothed    = SMOOTH_ALPHA * raw_action + ACTION_MOMENTUM * smoothed_action
-        new_smoothed      = raw_action
+        new_smoothed      = SMOOTH_ALPHA * raw_action + ACTION_MOMENTUM * smoothed_action
         new_accumulated   = accumulated_state + new_smoothed
 
         fwd = FIXED_SPEED - MAX_LATERAL * abs(new_smoothed)
         lat = MAX_LATERAL * new_smoothed
-        self._publish_vel(vx=fwd, vy=lat)
+        # Altitude P-controller: correct vertical drift during avoidance.
+        if self._target_alt is not None:
+            alt_err = self._target_alt - self._alt
+            vz = float(np.clip(1.0 * alt_err, -0.5, 0.5))
+        else:
+            vz = 0.0
+        self._publish_vel(vx=fwd, vy=lat, vz=vz)
 
         step_latency_ms = (time.monotonic() - t_step_start) * 1000.0
         t = time.monotonic() - t0
@@ -597,12 +605,29 @@ class FreeriderNode(Node):
             rclpy.spin_once(self, timeout_sec=0.1)
 
         self.get_logger().info(f'Takeoff complete (now in {self.state.mode}).')
+
+        # Let altitude settle for a few seconds before we lock in the target.
+        # AUTO.TAKEOFF may overshoot slightly; this gives the controller time to stabilize.
+        self.get_logger().info('Waiting for altitude to stabilize...')
+        stabilize_deadline = time.monotonic() + 3.0
+        while time.monotonic() < stabilize_deadline:
+            if self._rc_override():
+                self.get_logger().info('RC override during stabilization — aborting.')
+                return
+            rclpy.spin_once(self, timeout_sec=0.1)
+        self.get_logger().info(f'Altitude stable at {self._alt:.2f} m')
+
         self._start_camera()
 
         result = self._switch_offboard()
         if not result:
             self.get_logger().error('Failed to enter OFFBOARD — aborting.')
             return
+
+        # Capture altitude at the moment of OFFBOARD entry.
+        # The altitude P-controller in _avoidance_step will hold this throughout the flight.
+        self._target_alt = self._alt
+        self.get_logger().info(f'OFFBOARD target altitude locked: {self._target_alt:.2f} m')
 
         latencies         = []
         frame_stack       = deque(maxlen=N_FRAMES)

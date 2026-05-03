@@ -506,8 +506,7 @@ def main():
                 image_np          = np.stack(list(frame_stack), axis=0)
                 state_np          = np.array([accumulated_state], dtype=np.float32)
                 raw_action        = float(np.clip(trt_engine.infer(image_np, state_np), -1.0, 1.0))
-                # smoothed        = SMOOTH_ALPHA * raw_action + ACTION_MOMENTUM * smoothed
-                smoothed          = raw_action
+                smoothed          = SMOOTH_ALPHA * raw_action + ACTION_MOMENTUM * smoothed
                 accumulated_state += smoothed
 
                 fwd = FIXED_SPEED - MAX_LATERAL * abs(smoothed)
