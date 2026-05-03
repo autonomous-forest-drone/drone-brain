@@ -504,7 +504,7 @@ class FreeriderNode(Node):
                         accumulated_state: float, t0: float):
         bgr = self._get_frame()
         if bgr is None:
-            return frame_stack, smoothed_action, accumulated_state, 0.0, 0.0, 0.0
+            return frame_stack, smoothed_action, smoothed_action, accumulated_state, 0.0, 0.0, 0.0
 
         t_step_start = time.monotonic()
 
