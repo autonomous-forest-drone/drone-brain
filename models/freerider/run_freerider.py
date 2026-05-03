@@ -56,8 +56,7 @@ atexit.register(_pycuda_ctx.pop)
 
 import rclpy
 from cv_bridge import CvBridge
-from geometry_msgs.msg import TwistStamped
-from mavros_msgs.msg import PlayTuneV2, State, StatusText
+from mavros_msgs.msg import PlayTuneV2, PositionTarget, State, StatusText
 from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
 from nav_msgs.msg import Odometry
 from PIL import Image as PILImage
@@ -260,7 +259,6 @@ class FreeriderNode(Node):
 
         self.state          = State()
         self._left_rc_modes = False
-        self._yaw           = 0.0
         self._alt           = 0.0    # altitude from odometry (ENU, metres above home)
         self._target_alt    = None   # set after offboard entry; P controller holds this altitude
         self._latest_bgr    = None   # used in sim mode only
@@ -287,7 +285,7 @@ class FreeriderNode(Node):
         self.arm_client  = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.mode_client = self.create_client(SetMode,     '/mavros/set_mode')
         self.land_client = self.create_client(CommandTOL,  '/mavros/cmd/land')
-        self.vel_pub     = self.create_publisher(TwistStamped, '/mavros/setpoint_velocity/cmd_vel', 10)
+        self.vel_pub     = self.create_publisher(PositionTarget, '/mavros/setpoint_raw/local', 10)
         self.tune_pub    = self.create_publisher(PlayTuneV2,   '/mavros/play_tune', 10)
 
         if os.path.exists(DEPTH_ENGINE_PATH):
@@ -333,10 +331,6 @@ class FreeriderNode(Node):
         self.get_logger().info(f'[PX4] {msg.text}')
 
     def _on_odom(self, msg):
-        q = msg.pose.pose.orientation
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self._yaw = np.arctan2(siny_cosp, cosy_cosp)
         self._alt = msg.pose.pose.position.z
 
     def _on_sim_image(self, msg):
@@ -361,14 +355,25 @@ class FreeriderNode(Node):
     # Velocity publishing
     # ------------------------------------------------------------------
 
+    # Velocity-only type mask: ignore position, acceleration, yaw, yaw rate.
+    _TYPE_MASK = (
+        PositionTarget.IGNORE_PX | PositionTarget.IGNORE_PY | PositionTarget.IGNORE_PZ |
+        PositionTarget.IGNORE_AFX | PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
+        PositionTarget.IGNORE_YAW | PositionTarget.IGNORE_YAW_RATE
+    )
+
     def _publish_vel(self, vx: float = 0.0, vy: float = 0.0, vz: float = 0.0):
-        yaw = self._yaw
-        msg = TwistStamped()
-        msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'map'
-        msg.twist.linear.x  = vx * np.cos(yaw) - vy * np.sin(yaw)
-        msg.twist.linear.y  = vx * np.sin(yaw) + vy * np.cos(yaw)
-        msg.twist.linear.z  = vz
+        """Publish velocity in body frame (FRAME_BODY_NED).
+        vx=forward, vy=left (positive left), vz=up (positive up).
+        NED convention: y=right, z=down — so vy and vz are negated.
+        """
+        msg = PositionTarget()
+        msg.header.stamp     = self.get_clock().now().to_msg()
+        msg.coordinate_frame = PositionTarget.FRAME_BODY_NED
+        msg.type_mask        = self._TYPE_MASK
+        msg.velocity.x       = vx
+        msg.velocity.y       = -vy   # NED y=right, our vy=left
+        msg.velocity.z       = -vz   # NED z=down, our vz=up
         self.vel_pub.publish(msg)
 
     def _play_tune(self, tune: str):
