@@ -262,6 +262,7 @@ class FreeriderNode(Node):
         self._left_rc_modes = False
         self._yaw           = 0.0
         self._alt           = 0.0    # altitude from odometry (ENU, metres above home)
+        self._odom_received = False  # True once the first odometry message arrives
         self._target_alt    = None   # set after offboard entry; P controller holds this altitude
         self._latest_bgr    = None   # used in sim mode only
         self._frame_lock    = threading.Lock()
@@ -336,8 +337,9 @@ class FreeriderNode(Node):
         q = msg.pose.pose.orientation
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self._yaw = np.arctan2(siny_cosp, cosy_cosp)
-        self._alt = msg.pose.pose.position.z
+        self._yaw           = np.arctan2(siny_cosp, cosy_cosp)
+        self._alt           = msg.pose.pose.position.z
+        self._odom_received = True
 
     def _on_sim_image(self, msg):
         try:
@@ -621,8 +623,11 @@ class FreeriderNode(Node):
             self.get_logger().error('Failed to enter OFFBOARD — aborting.')
             return
 
-        # Capture altitude at the moment of OFFBOARD entry.
-        # The altitude P-controller in _avoidance_step will hold this throughout the flight.
+        # Wait for at least one odometry message so _alt is a real reading, then lock
+        # the target altitude for the P-controller. Without this guard, _alt is still
+        # 0.0 and the controller would immediately command max descent.
+        while not self._odom_received:
+            rclpy.spin_once(self, timeout_sec=0.05)
         self._target_alt = self._alt
         self.get_logger().info(f'OFFBOARD target altitude locked: {self._target_alt:.2f} m')
         self._play_tune('MFT240L8 O5 CC')    # two quick high beeps: OFFBOARD active
