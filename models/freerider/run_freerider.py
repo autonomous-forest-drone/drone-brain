@@ -246,11 +246,13 @@ class DepthEstimatorTRT:
 class FreeriderNode(Node):
 
     def __init__(self, engine_path: str, flight_dir: str, sim: bool = False,
-                 sim_image_topic: str = SIM_IMAGE_TOPIC, no_save: bool = False):
+                 sim_image_topic: str = SIM_IMAGE_TOPIC, no_save: bool = False,
+                 alt_hold: bool = False):
         super().__init__('freerider')
 
         self._sim        = sim
         self._no_save    = no_save
+        self._alt_hold   = alt_hold
         self._flight_dir = flight_dir
         self._frames_dir = os.path.join(flight_dir, 'frames')
         self._depth_dir  = os.path.join(flight_dir, 'depth')
@@ -260,7 +262,7 @@ class FreeriderNode(Node):
         self.state          = State()
         self._left_rc_modes = False
         self._alt           = 0.0    # altitude from odometry (ENU, metres above home)
-        self._target_alt    = None   # set after offboard entry; P controller holds this altitude
+        self._target_alt    = None   # set after takeoff when --alt-hold is enabled
         self._latest_bgr    = None   # used in sim mode only
         self._frame_lock    = threading.Lock()
         self._camera        = None   # Camera instance (real hardware)
@@ -520,8 +522,7 @@ class FreeriderNode(Node):
 
         fwd = FIXED_SPEED - MAX_LATERAL * abs(new_smoothed)
         lat = MAX_LATERAL * new_smoothed
-        # Altitude P-controller: correct vertical drift during avoidance.
-        if self._target_alt is not None:
+        if self._alt_hold and self._target_alt is not None:
             alt_err = self._target_alt - self._alt
             vz = float(np.clip(1.0 * alt_err, -0.5, 0.5))
         else:
@@ -617,11 +618,16 @@ class FreeriderNode(Node):
                 return
             rclpy.spin_once(self, timeout_sec=0.1)
 
-        self._target_alt = self._alt
-        self.get_logger().info(
-            f'Takeoff complete (now in {self.state.mode}). '
-            f'Altitude locked: {self._target_alt:.2f} m'
-        )
+        if self._alt_hold:
+            while self._alt < 0.3:
+                rclpy.spin_once(self, timeout_sec=0.05)
+            self._target_alt = self._alt
+            self.get_logger().info(
+                f'Takeoff complete (now in {self.state.mode}). '
+                f'Altitude locked: {self._target_alt:.2f} m'
+            )
+        else:
+            self.get_logger().info(f'Takeoff complete (now in {self.state.mode}).')
         self._play_tune('MFT120L4 O6 CEG')   # ascending 3-note: takeoff done
         self._start_camera()
 
@@ -851,6 +857,8 @@ def main():
                         help=f'ROS image topic in sim mode (default: {SIM_IMAGE_TOPIC})')
     parser.add_argument('--no-save', action='store_true',
                         help='Skip saving frames and depth JPEGs (measures pure pipeline latency)')
+    parser.add_argument('--alt-hold', action='store_true',
+                        help='Enable software altitude P-controller (default: rely on PX4)')
     args = parser.parse_args()
 
     stamp      = time.strftime('%Y-%m-%d_%H-%M-%S')
@@ -867,13 +875,15 @@ def main():
     else:
         print('Mode       : Real hardware')
         print('Camera     : IMX219 fixed-focus (sensor-id=0)')
+        print(f'Alt hold   : {"software P-controller" if args.alt_hold else "PX4 default"}')
         print('RC override: switch to ALTCTL or POSCTL at any time')
     print('=' * 60)
 
     rclpy.init()
     node = FreeriderNode(args.engine, flight_dir, sim=args.sim,
                          sim_image_topic=args.sim_image_topic,
-                         no_save=args.no_save)
+                         no_save=args.no_save,
+                         alt_hold=args.alt_hold)
     try:
         node.run()
     except KeyboardInterrupt:
