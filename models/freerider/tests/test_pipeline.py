@@ -529,7 +529,7 @@ def main():
                         ['ros2', 'topic', 'pub', '--once',
                          '/mavros/play_tune',
                          'mavros_msgs/msg/PlayTuneV2',
-                         '{format: 1, tune: "MFT240L8 O5 CC"}'],
+                         '{format: 1, tune: "MFT120L4 O6 CCC"}'],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
