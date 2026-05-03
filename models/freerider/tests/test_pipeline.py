@@ -486,7 +486,8 @@ def main():
     accumulated_state = 0.0   # running sum of smoothed actions — state input to actor
     step_count        = 0
     latencies         = []
-    t0          = time.monotonic()
+    t0               = time.monotonic()
+    last_beep        = t0
 
     with Camera() as cam:
         print(f'\nCapturing. Press Ctrl+C to stop.\n')
@@ -521,6 +522,11 @@ def main():
                     f'{fwd:.4f}', f'{lat:.4f}', f'{step_latency_ms:.1f}',
                 ])
                 log_file.flush()
+
+                now = time.monotonic()
+                if now - last_beep >= 2.0:
+                    print('\a', end='', flush=True)
+                    last_beep = now
 
                 step_count += 1
                 stamp_str  = f'{step_count:06d}'
