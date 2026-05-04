@@ -526,9 +526,7 @@ class FreeriderNode(Node):
         fwd = max(MIN_FWD_SPEED, FIXED_SPEED - MAX_LATERAL * abs(new_smoothed))
         lat = MAX_LATERAL * new_smoothed
         if self._alt_hold and self._target_alt is not None:
-            # Use abs() to get height magnitude — handles both ENU (positive) and
-            # NED (negative) odometry conventions without inverting the controller.
-            alt_err = abs(self._target_alt) - abs(self._alt)
+            alt_err = self._target_alt - self._alt
             vz = float(np.clip(1.0 * alt_err, -1.0, 1.0))
         else:
             vz = 0.0
