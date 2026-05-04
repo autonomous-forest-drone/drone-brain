@@ -78,8 +78,9 @@ DEPTH_MODEL_ID  = 'depth-anything/Depth-Anything-V2-Small-hf'
 IMG_H, IMG_W    = 144, 256
 N_FRAMES        = 3
 FIXED_SPEED     = 0.6
+MIN_FWD_SPEED   = 0.2    # training guarantee: fixed_speed - max_lateral = 1.0 - 0.8 = 0.2 m/s
 MAX_LATERAL     = 1.0
-ACTION_MOMENTUM = 0.3
+ACTION_MOMENTUM = 0.3    # default matches training; override with --momentum
 SMOOTH_ALPHA    = 1.0 - ACTION_MOMENTUM   # 0.7
 RGB_SAVE_EVERY  = 1                       # save every frame
 
@@ -247,12 +248,14 @@ class FreeriderNode(Node):
 
     def __init__(self, engine_path: str, flight_dir: str, sim: bool = False,
                  sim_image_topic: str = SIM_IMAGE_TOPIC, no_save: bool = False,
-                 alt_hold: bool = False):
+                 alt_hold: bool = False, momentum: float = ACTION_MOMENTUM):
         super().__init__('freerider')
 
         self._sim        = sim
         self._no_save    = no_save
         self._alt_hold   = alt_hold
+        self._momentum   = momentum
+        self._alpha      = 1.0 - momentum
         self._flight_dir = flight_dir
         self._frames_dir = os.path.join(flight_dir, 'frames')
         self._depth_dir  = os.path.join(flight_dir, 'depth')
@@ -517,14 +520,14 @@ class FreeriderNode(Node):
         state_np          = np.array([accumulated_state], dtype=np.float32)
 
         raw_action        = float(np.clip(self._trt.infer(image_np, state_np), -1.0, 1.0))
-        new_smoothed      = SMOOTH_ALPHA * raw_action + ACTION_MOMENTUM * smoothed_action
+        new_smoothed      = self._alpha * raw_action + self._momentum * smoothed_action
         new_accumulated   = accumulated_state + new_smoothed
 
-        fwd = max(0.0, FIXED_SPEED - MAX_LATERAL * abs(new_smoothed))
+        fwd = max(MIN_FWD_SPEED, FIXED_SPEED - MAX_LATERAL * abs(new_smoothed))
         lat = MAX_LATERAL * new_smoothed
         if self._alt_hold and self._target_alt is not None:
             alt_err = self._target_alt - self._alt
-            vz = float(np.clip(1.0 * alt_err, -0.5, 0.5))
+            vz = float(np.clip(1.0 * alt_err, -1.0, 1.0))
         else:
             vz = 0.0
         self._publish_vel(vx=fwd, vy=lat, vz=vz)
@@ -619,16 +622,7 @@ class FreeriderNode(Node):
                 return
             rclpy.spin_once(self, timeout_sec=0.1)
 
-        if self._alt_hold:
-            while self._alt < 0.3:
-                rclpy.spin_once(self, timeout_sec=0.05)
-            self._target_alt = self._alt
-            self.get_logger().info(
-                f'Takeoff complete (now in {self.state.mode}). '
-                f'Altitude locked: {self._target_alt:.2f} m'
-            )
-        else:
-            self.get_logger().info(f'Takeoff complete (now in {self.state.mode}).')
+        self.get_logger().info(f'Takeoff complete (now in {self.state.mode}).')
         self._play_tune('MFT120L4 O6 CEG')   # ascending 3-note: takeoff done
         self._start_camera()
 
@@ -636,6 +630,10 @@ class FreeriderNode(Node):
         if not result:
             self.get_logger().error('Failed to enter OFFBOARD — aborting.')
             return
+
+        if self._alt_hold:
+            self._target_alt = self._alt
+            self.get_logger().info(f'Altitude locked at OFFBOARD entry: {self._target_alt:.2f} m')
 
         self._play_tune('MFT120L4 O6 CCC')   # three beeps: OFFBOARD active
 
@@ -868,6 +866,9 @@ def main():
                         help='Skip saving frames and depth JPEGs (measures pure pipeline latency)')
     parser.add_argument('--alt-hold', action='store_true',
                         help='Enable software altitude P-controller (default: rely on PX4)')
+    parser.add_argument('--momentum', type=float, default=ACTION_MOMENTUM,
+                        help=f'Action smoothing momentum 0–1 (default: {ACTION_MOMENTUM}, '
+                             f'higher = smoother/slower corrections)')
     args = parser.parse_args()
 
     stamp      = time.strftime('%Y-%m-%d_%H-%M-%S')
@@ -885,6 +886,7 @@ def main():
         print('Mode       : Real hardware')
         print('Camera     : IMX219 fixed-focus (sensor-id=0)')
         print(f'Alt hold   : {"software P-controller" if args.alt_hold else "PX4 default"}')
+        print(f'Momentum   : {args.momentum}  (alpha={1.0 - args.momentum:.1f})')
         print('RC override: switch to ALTCTL or POSCTL at any time')
     print('=' * 60)
 
@@ -892,7 +894,8 @@ def main():
     node = FreeriderNode(args.engine, flight_dir, sim=args.sim,
                          sim_image_topic=args.sim_image_topic,
                          no_save=args.no_save,
-                         alt_hold=args.alt_hold)
+                         alt_hold=args.alt_hold,
+                         momentum=args.momentum)
     try:
         node.run()
     except KeyboardInterrupt:

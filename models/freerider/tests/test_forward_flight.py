@@ -44,7 +44,7 @@ PRESTREAM_TIME  = 2.0
 FORWARD_SPEED   = 0.6    # m/s — same as FIXED_SPEED in run_freerider
 FORWARD_TIME    = 5.0    # seconds of straight forward flight before landing
 ALT_HOLD_GAIN   = 1.0    # P gain (m/s per m error)
-ALT_HOLD_MAX_VZ = 0.5    # max vertical correction (m/s)
+ALT_HOLD_MAX_VZ = 1.0    # max vertical correction (m/s)
 
 _CMD_INTERVAL     = 2.0
 _ARM_TIMEOUT      = 30.0
@@ -282,23 +282,17 @@ class ForwardFlightNode(Node):
                 return
             rclpy.spin_once(self, timeout_sec=0.1)
 
-        if self._alt_hold:
-            # Wait for a valid altitude reading before locking target
-            while self._alt < 0.3:
-                rclpy.spin_once(self, timeout_sec=0.05)
-            self._target_alt = self._alt
-            self.get_logger().info(
-                f'Takeoff complete (now in {self.state.mode}). '
-                f'Altitude locked: {self._target_alt:.2f} m'
-            )
-        else:
-            self.get_logger().info(f'Takeoff complete (now in {self.state.mode}).')
+        self.get_logger().info(f'Takeoff complete (now in {self.state.mode}).')
         self._play_tune('MFT120L4 O6 CEG')   # ascending: takeoff done
 
         result = self._switch_offboard()
         if not result:
             self.get_logger().error('Failed to enter OFFBOARD — aborting.')
             return
+
+        if self._alt_hold:
+            self._target_alt = self._alt
+            self.get_logger().info(f'Altitude locked at OFFBOARD entry: {self._target_alt:.2f} m')
 
         alt_info = f'Target alt: {self._target_alt:.2f} m' if self._alt_hold else 'PX4 alt hold'
         self.get_logger().info(
