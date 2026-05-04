@@ -77,7 +77,7 @@ FLIGHT_LOG_ROOT = os.path.expanduser('~/drone-brain/images')
 DEPTH_MODEL_ID  = 'depth-anything/Depth-Anything-V2-Small-hf'
 IMG_H, IMG_W    = 144, 256
 N_FRAMES        = 3
-FIXED_SPEED     = 0.6
+FIXED_SPEED     = 0.8
 MIN_FWD_SPEED   = 0.2    # training guarantee: fixed_speed - max_lateral = 1.0 - 0.8 = 0.2 m/s
 MAX_LATERAL     = 1.0
 ACTION_MOMENTUM = 0.3    # default matches training; override with --momentum
