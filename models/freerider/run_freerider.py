@@ -264,7 +264,7 @@ class FreeriderNode(Node):
 
         self.state          = State()
         self._left_rc_modes = False
-        self._alt           = 0.0    # altitude from odometry (ENU, metres above home)
+        self._alt           = 0.0    # altitude from odometry (z from /local_position/odom — may be negative NED)
         self._target_alt    = None   # set after takeoff when --alt-hold is enabled
         self._latest_bgr    = None   # used in sim mode only
         self._frame_lock    = threading.Lock()
@@ -526,7 +526,9 @@ class FreeriderNode(Node):
         fwd = max(MIN_FWD_SPEED, FIXED_SPEED - MAX_LATERAL * abs(new_smoothed))
         lat = MAX_LATERAL * new_smoothed
         if self._alt_hold and self._target_alt is not None:
-            alt_err = self._target_alt - self._alt
+            # Use abs() to get height magnitude — handles both ENU (positive) and
+            # NED (negative) odometry conventions without inverting the controller.
+            alt_err = abs(self._target_alt) - abs(self._alt)
             vz = float(np.clip(1.0 * alt_err, -1.0, 1.0))
         else:
             vz = 0.0

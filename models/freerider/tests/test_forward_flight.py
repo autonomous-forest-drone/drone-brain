@@ -304,7 +304,9 @@ class ForwardFlightNode(Node):
         deadline = time.monotonic() + FORWARD_TIME
         while time.monotonic() < deadline:
             if self._alt_hold:
-                alt_err = self._target_alt - self._alt
+                # Use abs() to get height magnitude — handles both ENU (positive) and
+                # NED (negative) odometry conventions without inverting the controller.
+                alt_err = abs(self._target_alt) - abs(self._alt)
                 vz = float(np.clip(ALT_HOLD_GAIN * alt_err, -ALT_HOLD_MAX_VZ, ALT_HOLD_MAX_VZ))
             else:
                 vz = 0.0
