@@ -112,11 +112,14 @@ def main():
 
     # Watchdog runs in a plain thread — independent of rclpy so it always fires
     def _watchdog_loop():
+        print('[watchdog] thread started', flush=True)
         while True:
             time.sleep(3.0)
+            print('[watchdog] tick', flush=True)
             node._watchdog()
 
     threading.Thread(target=_watchdog_loop, daemon=True).start()
+    print('[main] entering spin', flush=True)
 
     try:
         rclpy.spin(node)
