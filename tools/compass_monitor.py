@@ -102,11 +102,24 @@ class CompassMonitor(Node):
             return
         self._last_print = now
 
+        # Derive compass bearing from EKF yaw when mag stream unavailable
+        # ENU yaw: 0=East, 90=North, CCW positive
+        # NED compass: 0=North, 90=East, CW positive  → bearing = (90 - yaw) % 360
+        if self._yaw_deg is not None:
+            bearing = (90.0 - self._yaw_deg) % 360.0
+            bearing_str = f'{bearing:5.1f}°'
+        elif self._heading_deg is not None:
+            bearing_str = f'{self._heading_deg:5.1f}°'
+        elif self._mag_deg is not None:
+            bearing_str = f'{self._mag_deg:5.1f}°'
+        else:
+            bearing_str = '  N/A '
+
         mag = f'{self._mag_deg:5.1f}°'     if self._mag_deg     is not None else '  N/A '
         hdg = f'{self._heading_deg:5.1f}°' if self._heading_deg is not None else '  N/A '
         yaw = f'{self._yaw_deg:+6.1f}°'   if self._yaw_deg     is not None else '   N/A'
 
-        print(f'mag={mag} (N=0,E=90)   gps_hdg={hdg}   ekf_yaw={yaw} (ENU)')
+        print(f'bearing={bearing_str}   ekf_yaw={yaw} (ENU)   mag={mag}   gps_hdg={hdg}')
 
 
 def main():
