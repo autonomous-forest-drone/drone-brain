@@ -527,6 +527,7 @@ class FreeriderNode(Node):
         lat = MAX_LATERAL * new_smoothed
         if self._alt_hold and self._target_alt is not None:
             alt_err = self._target_alt - self._alt
+            print(f'[ALT-DBG] target={self._target_alt:.4f} alt={self._alt:.4f} err={alt_err:.4f}', flush=True)
             vz = float(np.clip(1.0 * alt_err, -1.0, 1.0))
         else:
             vz = 0.0
