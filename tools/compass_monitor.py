@@ -90,6 +90,7 @@ class CompassMonitor(Node):
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         yaw_rad   = math.atan2(siny_cosp, cosy_cosp)
         self._yaw_deg = math.degrees(yaw_rad)
+        self._maybe_print()
 
     def _maybe_print(self):
         now = time.monotonic()
@@ -110,16 +111,12 @@ def main():
     node = CompassMonitor()
     print('Listening to MAVROS compass/IMU topics — Ctrl-C to stop', flush=True)
 
-    # Watchdog runs in a plain thread — independent of rclpy so it always fires
     def _watchdog_loop():
-        print('[watchdog] thread started', flush=True)
         while True:
             time.sleep(3.0)
-            print('[watchdog] tick', flush=True)
             node._watchdog()
 
     threading.Thread(target=_watchdog_loop, daemon=True).start()
-    print('[main] entering spin', flush=True)
 
     try:
         rclpy.spin(node)
