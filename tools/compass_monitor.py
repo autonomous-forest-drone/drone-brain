@@ -61,13 +61,10 @@ class CompassMonitor(Node):
         self.create_subscription(Imu,           '/mavros/imu/data',                    self._on_imu,     qos)
         self.create_subscription(Imu,           '/mavros/imu/data_raw',                self._on_imu,     qos)
 
-        # Watchdog: print status every 3 s until first message arrives
-        self.create_timer(3.0, self._watchdog)
-
     def _watchdog(self):
         if self._mag_deg is None and self._yaw_deg is None and self._heading_deg is None:
             elapsed = time.monotonic() - self._start_time
-            print(f'  [{elapsed:.0f}s] no data yet — check: ros2 topic list | grep mavros')
+            print(f'  [{elapsed:.0f}s] no data yet — check: ros2 topic list | grep mavros', flush=True)
 
     def _on_heading(self, msg):
         self._heading_deg = msg.data
@@ -110,9 +107,14 @@ def main():
     mavros_proc = start_mavros()
     rclpy.init()
     node = CompassMonitor()
-    print('Listening to MAVROS compass/IMU topics — Ctrl-C to stop')
+    print('Listening to MAVROS compass/IMU topics — Ctrl-C to stop', flush=True)
+    last_watchdog = time.monotonic()
     try:
-        rclpy.spin(node)
+        while rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.1)
+            if time.monotonic() - last_watchdog >= 3.0:
+                node._watchdog()
+                last_watchdog = time.monotonic()
     except KeyboardInterrupt:
         print()
     finally:
