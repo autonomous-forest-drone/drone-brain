@@ -5,7 +5,7 @@ altitude_monitor.py — Print altitude readings from a running MAVROS instance.
 Shows odom.z (what the P-controller reads) alongside the absolute altitude
 topics so you can spot sign convention issues and drift.
 
-  odom.z    — z from /mavros/local_position/odom  (ENU or NED depending on setup)
+  odom.z    — z from /mavros/local_position/odom  (ENU: positive = up)
   rel       — relative altitude from /mavros/altitude (above home, barometer)
   amsl      — above mean sea level from /mavros/altitude (GPS-fused)
 
@@ -19,7 +19,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import qos_profile_sensor_data
 from nav_msgs.msg import Odometry
 
 FCU_URL   = '/dev/ttyTHS1:115200'
@@ -50,7 +50,6 @@ class AltitudeMonitor(Node):
 
     def __init__(self):
         super().__init__('altitude_monitor')
-        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
         self._odom_z     = None
         self._rel        = None
@@ -58,10 +57,10 @@ class AltitudeMonitor(Node):
         self._last_print = 0.0
         self._start_time = time.monotonic()
 
-        self.create_subscription(Odometry, '/mavros/local_position/odom', self._on_odom, qos)
+        self.create_subscription(Odometry, '/mavros/local_position/odom', self._on_odom, qos_profile_sensor_data)
 
         if _HAS_ALTITUDE_MSG:
-            self.create_subscription(Altitude, '/mavros/altitude', self._on_altitude, qos)
+            self.create_subscription(Altitude, '/mavros/altitude', self._on_altitude, qos_profile_sensor_data)
         else:
             self.get_logger().warn('mavros_msgs.Altitude not available — only odom.z shown')
 

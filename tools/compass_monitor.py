@@ -2,9 +2,11 @@
 """
 compass_monitor.py — Print compass heading and yaw from a running MAVROS instance.
 
-  heading   — compass heading in degrees from /mavros/global_position/compass_hdg
-              (0° = North, 90° = East, clockwise)
-  yaw       — yaw extracted from IMU quaternion (/mavros/imu/data)
+  mag       — heading from raw magnetometer (no GPS needed)
+              (NED convention: 0° = North, 90° = East, clockwise)
+  gps_hdg   — GPS-fused heading from /mavros/global_position/compass_hdg
+              (only available with GPS fix)
+  ekf_yaw   — yaw extracted from IMU quaternion (/mavros/imu/data)
               (ENU convention: 0° = East, 90° = North, counter-clockwise)
 
 Usage (MAVROS must already be running):
@@ -19,7 +21,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Imu, MagneticField
 from std_msgs.msg import Float64
 
@@ -46,7 +48,6 @@ class CompassMonitor(Node):
 
     def __init__(self):
         super().__init__('compass_monitor')
-        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
         self._heading_deg = None   # GPS-fused heading (optional)
         self._mag_deg     = None   # raw magnetometer heading (no GPS needed)
@@ -54,13 +55,16 @@ class CompassMonitor(Node):
         self._last_print  = 0.0
         self._start_time  = time.monotonic()
 
+        # Use sensor_data QoS preset — matches what MAVROS uses for IMU/mag topics
+        sensor_qos = qos_profile_sensor_data
+
         # GPS-fused heading — only available with GPS fix
-        self.create_subscription(Float64,       '/mavros/global_position/compass_hdg', self._on_heading, qos)
+        self.create_subscription(Float64,       '/mavros/global_position/compass_hdg', self._on_heading, sensor_qos)
         # Raw magnetometer — always available when FCU is connected
-        self.create_subscription(MagneticField, '/mavros/imu/mag',                     self._on_mag,     qos)
+        self.create_subscription(MagneticField, '/mavros/imu/mag',                     self._on_mag,     sensor_qos)
         # EKF orientation (filtered) and raw IMU
-        self.create_subscription(Imu,           '/mavros/imu/data',                    self._on_imu,     qos)
-        self.create_subscription(Imu,           '/mavros/imu/data_raw',                self._on_imu,     qos)
+        self.create_subscription(Imu,           '/mavros/imu/data',                    self._on_imu,     sensor_qos)
+        self.create_subscription(Imu,           '/mavros/imu/data_raw',                self._on_imu,     sensor_qos)
 
     def _watchdog(self):
         if self._mag_deg is None and self._yaw_deg is None and self._heading_deg is None:
