@@ -53,7 +53,9 @@ class CompassMonitor(Node):
         self._start_time  = time.monotonic()
 
         self.create_subscription(Float64, '/mavros/global_position/compass_hdg', self._on_heading, qos)
-        self.create_subscription(Imu,     '/mavros/imu/data',                    self._on_imu,     qos)
+        # Try both filtered and raw IMU — raw is always available when connected
+        self.create_subscription(Imu, '/mavros/imu/data',     self._on_imu, qos)
+        self.create_subscription(Imu, '/mavros/imu/data_raw', self._on_imu, qos)
 
         # Watchdog: print status every 3 s until first message arrives
         self.create_timer(3.0, self._watchdog)
@@ -61,7 +63,7 @@ class CompassMonitor(Node):
     def _watchdog(self):
         if self._heading_deg is None and self._yaw_deg is None:
             elapsed = time.monotonic() - self._start_time
-            print(f'  [{elapsed:.0f}s] waiting for /mavros/global_position/compass_hdg and /mavros/imu/data ...')
+            print(f'  [{elapsed:.0f}s] no data yet — check: ros2 topic list | grep mavros')
 
     def _on_heading(self, msg):
         self._heading_deg = msg.data
