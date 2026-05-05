@@ -52,10 +52,11 @@ class AltitudeMonitor(Node):
         super().__init__('altitude_monitor')
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
-        self._odom_z    = None
-        self._rel       = None
-        self._amsl      = None
+        self._odom_z     = None
+        self._rel        = None
+        self._amsl       = None
         self._last_print = 0.0
+        self._start_time = time.monotonic()
 
         self.create_subscription(Odometry, '/mavros/local_position/odom', self._on_odom, qos)
 
@@ -63,6 +64,14 @@ class AltitudeMonitor(Node):
             self.create_subscription(Altitude, '/mavros/altitude', self._on_altitude, qos)
         else:
             self.get_logger().warn('mavros_msgs.Altitude not available — only odom.z shown')
+
+        # Watchdog: print status every 3 s until first message arrives
+        self.create_timer(3.0, self._watchdog)
+
+    def _watchdog(self):
+        if self._odom_z is None:
+            elapsed = time.monotonic() - self._start_time
+            print(f'  [{elapsed:.0f}s] waiting for /mavros/local_position/odom ...')
 
     def _on_odom(self, msg):
         self._odom_z = msg.pose.pose.position.z

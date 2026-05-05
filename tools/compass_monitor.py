@@ -50,9 +50,18 @@ class CompassMonitor(Node):
         self._heading_deg = None   # compass_hdg topic (NED, 0=North)
         self._yaw_deg     = None   # derived from IMU quaternion (ENU, 0=East)
         self._last_print  = 0.0
+        self._start_time  = time.monotonic()
 
         self.create_subscription(Float64, '/mavros/global_position/compass_hdg', self._on_heading, qos)
         self.create_subscription(Imu,     '/mavros/imu/data',                    self._on_imu,     qos)
+
+        # Watchdog: print status every 3 s until first message arrives
+        self.create_timer(3.0, self._watchdog)
+
+    def _watchdog(self):
+        if self._heading_deg is None and self._yaw_deg is None:
+            elapsed = time.monotonic() - self._start_time
+            print(f'  [{elapsed:.0f}s] waiting for /mavros/global_position/compass_hdg and /mavros/imu/data ...')
 
     def _on_heading(self, msg):
         self._heading_deg = msg.data

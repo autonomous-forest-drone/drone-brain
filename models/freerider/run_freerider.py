@@ -627,25 +627,25 @@ class FreeriderNode(Node):
         self._play_tune('MFT120L4 O6 CEG')   # ascending 3-note: takeoff done
         self._start_camera()
 
-        result = self._switch_offboard()
-        if not result:
-            self.get_logger().error('Failed to enter OFFBOARD — aborting.')
-            return
-
-        if self._alt_hold:
-            self._target_alt = self._alt
-            self.get_logger().info(f'Altitude locked at OFFBOARD entry: {self._target_alt:.2f} m')
-
-        self._play_tune('MFT120L4 O6 CCC')   # three beeps: OFFBOARD active
-
         latencies         = []
         frame_stack       = deque(maxlen=N_FRAMES)
         smoothed          = 0.0
         accumulated_state = 0.0   # running sum of smoothed actions — state input to actor
         t0                = time.monotonic()
 
-        self.get_logger().info('Freerider avoidance active. RC override to exit.')
         try:
+            result = self._switch_offboard()
+            if not result:
+                self.get_logger().error('Failed to enter OFFBOARD — aborting.')
+                return
+
+            if self._alt_hold:
+                self._target_alt = self._alt
+                self.get_logger().info(f'Altitude locked at OFFBOARD entry: {self._target_alt:.2f} m')
+
+            self._play_tune('MFT120L4 O6 CCC')   # three beeps: OFFBOARD active
+
+            self.get_logger().info('Freerider avoidance active. RC override to exit.')
             while True:
                 rclpy.spin_once(self, timeout_sec=dt)
                 if self._rc_override():
