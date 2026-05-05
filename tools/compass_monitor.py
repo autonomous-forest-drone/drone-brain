@@ -14,6 +14,7 @@ Usage (MAVROS must already be running):
 import math
 import os
 import subprocess
+import threading
 import time
 
 import rclpy
@@ -108,13 +109,17 @@ def main():
     rclpy.init()
     node = CompassMonitor()
     print('Listening to MAVROS compass/IMU topics — Ctrl-C to stop', flush=True)
-    last_watchdog = time.monotonic()
+
+    # Watchdog runs in a plain thread — independent of rclpy so it always fires
+    def _watchdog_loop():
+        while True:
+            time.sleep(3.0)
+            node._watchdog()
+
+    threading.Thread(target=_watchdog_loop, daemon=True).start()
+
     try:
-        while rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=0.1)
-            if time.monotonic() - last_watchdog >= 3.0:
-                node._watchdog()
-                last_watchdog = time.monotonic()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         print()
     finally:
