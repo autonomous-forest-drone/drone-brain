@@ -11,10 +11,12 @@ alongside it:
     freerider/model/freerider_actor.onnx
     freerider/model/freerider_actor.trt
 
-Architecture (v5 actor path):
-    image (1, 3, 144, 256) ──► CNN ──► Linear(cnn_out, 256)+ReLU ──┐
-    state (1, 1)  ─────────────────────────────────────────────────►cat(257)
-                                                                     └──► MLP[64,64] ──► Linear(64,1) ──► action (1,1)
+Architecture (v7 actor path):
+    image (1, 3, 144, 192) ──► CNN ──► Linear(cnn_out, 256)+ReLU ──┐
+    state (1, 2)  ─────────────────────────────────────────────────►cat(258)
+                                                                     └──► MLP[128,128] ──► Linear(128,1) ──► action (1,1)
+
+    state = [accumulated_action, prev_smoothed_action]
 
 VecNormalize was trained with norm_obs=False — raw depth [0,1] is used
 directly, no normalisation needed at inference time.
@@ -42,8 +44,8 @@ MODEL_DIR  = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'model'))
 # Architecture constants — must match the values used during training
 # ---------------------------------------------------------------------------
 CNN_FEATURES_DIM   = 256   # CNN head output dim
-STATE_DIM          = 1     # accumulated action scalar
-ACTOR_FEATURES_DIM = CNN_FEATURES_DIM + STATE_DIM   # 257
+STATE_DIM          = 2     # [accumulated_action, prev_smoothed_action]
+ACTOR_FEATURES_DIM = CNN_FEATURES_DIM + STATE_DIM   # 258
 PRIVILEGED_DIM     = 45    # critic-only input; not used at inference
 
 
@@ -53,7 +55,7 @@ PRIVILEGED_DIM     = 45    # critic-only input; not used at inference
 # ---------------------------------------------------------------------------
 
 class ActorFeaturesExtractor(BaseFeaturesExtractor):
-    """CNN over stacked depth frames + accumulated action scalar → 257-dim."""
+    """CNN over stacked depth frames + state vector → 258-dim."""
 
     def __init__(self, observation_space: spaces.Dict, features_dim: int = ACTOR_FEATURES_DIM):
         super().__init__(observation_space, features_dim=features_dim)
@@ -127,8 +129,8 @@ class FreeriderActorWrapper(nn.Module):
 
     Inputs
     ------
-    image : (B, 3, 144, 256) float32 — stacked depth frames in [0, 1]
-    state : (B, 1)           float32 — accumulated smoothed lateral action
+    image : (B, 3, 144, 192) float32 — strided depth frames in [0, 1]
+    state : (B, 2)           float32 — [accumulated_action, prev_smoothed_action]
 
     Output
     ------
@@ -211,7 +213,7 @@ def main():
             'policy_kwargs': dict(
                 features_extractor_class=ActorFeaturesExtractor,
                 features_extractor_kwargs=dict(features_dim=ACTOR_FEATURES_DIM),
-                net_arch=dict(pi=[64, 64], vf=[]),
+                net_arch=dict(pi=[128, 128], vf=[]),
                 normalize_images=False,
                 share_features_extractor=True,
             ),
@@ -225,8 +227,8 @@ def main():
 
     # Sanity-check forward pass
     with torch.no_grad():
-        dummy_image  = torch.zeros(1, 3, 144, 256)
-        dummy_state  = torch.zeros(1, 1)
+        dummy_image  = torch.zeros(1, 3, 144, 192)
+        dummy_state  = torch.zeros(1, 2)
         dummy_action = wrapper(dummy_image, dummy_state)
     print(f'[export] Sanity check passed — output shape: {dummy_action.shape}')
 
@@ -272,7 +274,7 @@ def main():
         f'--onnx={onnx_path}',
         f'--saveEngine={trt_path}',
         '--fp16',
-        '--shapes=image:1x3x144x256,state:1x1',
+        '--shapes=image:1x3x144x192,state:1x2',
     ]
     print('[export] Running:', ' '.join(cmd))
     subprocess.check_call(cmd)

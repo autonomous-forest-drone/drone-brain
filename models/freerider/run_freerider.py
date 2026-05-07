@@ -4,7 +4,8 @@ FREERIDER — PPO obstacle avoidance flight script.
 
   • Depth Anything V2 Small (HuggingFace transformers) for monocular depth
   • Freerider actor (TensorRT FP16) with two inputs: image stack + state
-  • 3-frame depth stack  (3 × 144 × 256)
+  • 3-frame strided depth stack  (3 × 144 × 192, stride-4 / 0.8 s lookback at 10 Hz)
+  • State: [accumulated_action, prev_smoothed_action]  (2-dim, matches v7 training)
   • Action smoothing matching training: smoothed = 0.7 * raw + 0.3 * prev
   • Per-flight logs: images/<timestamp>/{frames/, depth/, flight.csv, flight.png}
 
@@ -12,7 +13,7 @@ Camera (real hardware):
   IMX219 fixed-focus camera on camera1 CSI port (sensor-id=0), read via appsink.
 
 Velocity (body frame):
-    fwd = FIXED_SPEED - MAX_LATERAL * |smoothed|
+    fwd = FIXED_SPEED * max(MIN_FWD_FACTOR, 1 - |smoothed|)   # min 0.6 m/s
     lat = MAX_LATERAL * smoothed
 
 Flow:
@@ -75,11 +76,12 @@ SETPOINT_HZ     = 10
 PRESTREAM_TIME  = 2.0
 FLIGHT_LOG_ROOT = os.path.expanduser('~/drone-brain/images')
 DEPTH_MODEL_ID  = 'depth-anything/Depth-Anything-V2-Small-hf'
-IMG_H, IMG_W    = 144, 256
+IMG_H, IMG_W    = 144, 192   # IMX219 4:3 native aspect ratio
 N_FRAMES        = 3
-FIXED_SPEED     = 0.8
-MIN_FWD_SPEED   = 0.2    # training guarantee: fixed_speed - max_lateral = 1.0 - 0.8 = 0.2 m/s
-MAX_LATERAL     = 1.0
+FRAME_STRIDE    = 4          # temporal stride — 0.8 s lookback at 10 Hz (matches v7 training)
+FIXED_SPEED     = 1.0
+MAX_LATERAL     = 0.8
+MIN_FWD_FACTOR  = 0.6        # min forward speed fraction even at max lateral action
 ACTION_MOMENTUM = 0.3    # default matches training; override with --momentum
 SMOOTH_ALPHA    = 1.0 - ACTION_MOMENTUM   # 0.7
 RGB_SAVE_EVERY  = 1                       # save every frame
@@ -503,27 +505,34 @@ class FreeriderNode(Node):
     # One policy step
     # ------------------------------------------------------------------
 
-    def _avoidance_step(self, frame_stack: deque, smoothed_action: float,
-                        accumulated_state: float, t0: float):
+    def _avoidance_step(self, frame_buffer: deque, smoothed_action: float,
+                        accumulated_action: float, t0: float):
         bgr = self._get_frame()
         if bgr is None:
-            return frame_stack, smoothed_action, smoothed_action, accumulated_state, 0.0, 0.0, 0.0
+            return frame_buffer, smoothed_action, smoothed_action, accumulated_action, 0.0, 0.0, 0.0
 
         t_step_start = time.monotonic()
 
         depth = self._depth.estimate(bgr)
-        frame_stack.append(depth)
-        while len(frame_stack) < N_FRAMES:
-            frame_stack.appendleft(frame_stack[0])
+        frame_buffer.append(depth)
 
-        image_np          = np.stack(list(frame_stack), axis=0)
-        state_np          = np.array([accumulated_state], dtype=np.float32)
+        # Build strided frame stack: sample oldest→newest at FRAME_STRIDE intervals
+        buf = list(frame_buffer)
+        n   = len(buf)
+        frames = []
+        for i in range(N_FRAMES - 1, -1, -1):   # 2, 1, 0 → oldest to newest
+            idx = max(0, n - 1 - i * FRAME_STRIDE)
+            frames.append(buf[idx])
+        image_np = np.stack(frames, axis=0)
+
+        # State: [accumulated_action, prev_smoothed_action] — matches v7 training
+        state_np          = np.array([accumulated_action, smoothed_action], dtype=np.float32)
 
         raw_action        = float(np.clip(self._trt.infer(image_np, state_np), -1.0, 1.0))
         new_smoothed      = self._alpha * raw_action + self._momentum * smoothed_action
-        new_accumulated   = accumulated_state + new_smoothed
+        new_accumulated   = accumulated_action + new_smoothed
 
-        fwd = max(MIN_FWD_SPEED, FIXED_SPEED - MAX_LATERAL * abs(new_smoothed))
+        fwd = FIXED_SPEED * max(MIN_FWD_FACTOR, 1.0 - abs(new_smoothed))
         lat = MAX_LATERAL * new_smoothed
         if self._alt_hold and self._target_alt is not None:
             alt_err = self._target_alt - self._alt
@@ -562,7 +571,7 @@ class FreeriderNode(Node):
                             fwd, lat, self._step_count, step_latency_ms)
             self._hud_writer.write(hud)
 
-        return frame_stack, raw_action, new_smoothed, new_accumulated, fwd, lat, step_latency_ms
+        return frame_buffer, raw_action, new_smoothed, new_accumulated, fwd, lat, step_latency_ms
 
     # ------------------------------------------------------------------
     # Main run sequence
@@ -628,7 +637,8 @@ class FreeriderNode(Node):
         self._start_camera()
 
         latencies         = []
-        frame_stack       = deque(maxlen=N_FRAMES)
+        _buf_len          = (N_FRAMES - 1) * FRAME_STRIDE + 1   # = 9 at 10 Hz → 0.8 s lookback
+        frame_buffer      = deque(maxlen=_buf_len)
         smoothed          = 0.0
         accumulated_state = 0.0   # running sum of smoothed actions — state input to actor
         t0                = time.monotonic()
@@ -655,8 +665,8 @@ class FreeriderNode(Node):
                 if not self.state.armed:
                     self.get_logger().info('Disarmed — stopping.')
                     break
-                frame_stack, raw, smoothed, accumulated_state, fwd, lat, latency_ms = self._avoidance_step(
-                    frame_stack, smoothed, accumulated_state, t0,
+                frame_buffer, raw, smoothed, accumulated_state, fwd, lat, latency_ms = self._avoidance_step(
+                    frame_buffer, smoothed, accumulated_state, t0,
                 )
                 if latency_ms > 0.0:
                     latencies.append(latency_ms)
