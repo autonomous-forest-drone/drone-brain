@@ -64,7 +64,33 @@ The `.trt` file is what `run_freerider.py` loads at runtime.
 
 ---
 
-## 2. Real hardware flight
+## 2. Flight presets
+
+Pass `--preset` to choose a validated parameter configuration. All presets use stride=3 and momentum=0.1, which outperform the trained defaults (stride=4, momentum=0.3) on real-world deployment speed.
+
+| Preset | fwd speed | lat speed | AirSim win% | Notes |
+|---|---|---|---|---|
+| `safe` _(default)_ | 1.5 m/s | 0.8 m/s | 87% | most conservative lateral range |
+| `balanced` | 1.5 m/s | 1.2 m/s | 87% | wider dodge room, same win rate |
+| `fast` | 2.0 m/s | 1.5 m/s | 90% | best overall; clears blind-spot faster |
+
+```bash
+python3 run_freerider.py --preset safe
+python3 run_freerider.py --preset balanced
+python3 run_freerider.py --preset fast
+
+# sim mode
+python3 run_freerider.py --preset fast --sim
+
+# override momentum on top of a preset
+python3 run_freerider.py --preset fast --momentum 0.15
+```
+
+> Sweep results: AirSim v7 environment, curriculum stage 2, 30 episodes per config.
+
+---
+
+## 3. Real hardware flight
 
 Everything runs on the **Jetson Orin Nano**.
 
@@ -133,7 +159,7 @@ A latency summary (average / min / max per step) is printed to the console on ex
 
 ---
 
-## 3. Simulation with AirSim
+## 4. Simulation with AirSim
 
 Everything runs on the **ground control station** (the machine where UE5 + AirSim are installed). The Jetson is not involved in simulation.
 

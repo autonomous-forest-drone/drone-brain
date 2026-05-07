@@ -23,8 +23,16 @@ Flow:
 RC override: switching to ALTCTL or POSCTL at any time exits the loop.
 
 Usage:
-    python run_freerider.py
-    python run_freerider.py --sim
+    python run_freerider.py                          # safe preset (default)
+    python run_freerider.py --preset balanced        # 1.5 m/s fwd, 1.2 m/s lat
+    python run_freerider.py --preset fast            # 2.0 m/s fwd, 1.5 m/s lat (90% AirSim)
+    python run_freerider.py --sim                    # simulation mode
+    python run_freerider.py --preset fast --sim
+
+Presets (AirSim sweep, stage 2, 30 episodes):
+    safe      fwd=1.5  lat=0.8  stride=3  mom=0.1   87% win
+    balanced  fwd=1.5  lat=1.2  stride=3  mom=0.1   87% win
+    fast      fwd=2.0  lat=1.5  stride=3  mom=0.1   90% win
 """
 
 import argparse
@@ -90,6 +98,16 @@ DEPTH_ENGINE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'model',
     'depth_anything_v2_small_fp16.trt'
 )
+
+# ---------------------------------------------------------------------------
+# Flight presets — validated in AirSim parameter sweep (v7, stage 2, 30 eps)
+# ---------------------------------------------------------------------------
+PRESETS = {
+    'safe':     {'fwd': 1.5, 'lat': 0.8, 'stride': 3, 'mom': 0.1},  # 87% win
+    'balanced': {'fwd': 1.5, 'lat': 1.2, 'stride': 3, 'mom': 0.1},  # 87% win
+    'fast':     {'fwd': 2.0, 'lat': 1.5, 'stride': 3, 'mom': 0.1},  # 90% win
+}
+DEFAULT_PRESET = 'safe'
 
 # HUD composite video dimensions
 _DISP_W, _DISP_H = 640, 360
@@ -158,6 +176,7 @@ class DepthEstimator:
         self._model     = AutoModelForDepthEstimation.from_pretrained(DEPTH_MODEL_ID)
         self._model.to(device).eval()
         self._device    = device
+        self._clahe     = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         print('[DepthEstimator] Ready.')
 
     def estimate(self, bgr: np.ndarray) -> np.ndarray:
@@ -174,7 +193,9 @@ class DepthEstimator:
             depth = (depth - d_min) / (d_max - d_min)
         else:
             depth = np.zeros_like(depth)
-        return depth.astype(np.float32)
+        gray  = (depth * 255).astype(np.uint8)
+        depth = self._clahe.apply(gray).astype(np.float32) / 255.0
+        return depth
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +231,7 @@ class DepthEstimatorTRT:
             self._context.set_tensor_address(name, int(dev))
 
         _, _, self._in_h, self._in_w = self._bindings['pixel_values']['shape']
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         print(f'[DepthEstimatorTRT] Input: {self._in_h}×{self._in_w}  Ready.')
 
     def _preprocess(self, bgr: np.ndarray) -> np.ndarray:
@@ -239,7 +261,9 @@ class DepthEstimatorTRT:
             depth = (depth - d_min) / (d_max - d_min)
         else:
             depth = np.zeros_like(depth)
-        return depth.astype(np.float32)
+        gray  = (depth * 255).astype(np.uint8)
+        depth = self._clahe.apply(gray).astype(np.float32) / 255.0
+        return depth
 
 
 # ---------------------------------------------------------------------------
@@ -250,14 +274,19 @@ class FreeriderNode(Node):
 
     def __init__(self, engine_path: str, flight_dir: str, sim: bool = False,
                  sim_image_topic: str = SIM_IMAGE_TOPIC, no_save: bool = False,
-                 alt_hold: bool = False, momentum: float = ACTION_MOMENTUM):
+                 alt_hold: bool = False, momentum: float = ACTION_MOMENTUM,
+                 fwd_speed: float = FIXED_SPEED, max_lateral: float = MAX_LATERAL,
+                 frame_stride: int = FRAME_STRIDE):
         super().__init__('freerider')
 
-        self._sim        = sim
-        self._no_save    = no_save
-        self._alt_hold   = alt_hold
-        self._momentum   = momentum
-        self._alpha      = 1.0 - momentum
+        self._sim          = sim
+        self._no_save      = no_save
+        self._alt_hold     = alt_hold
+        self._momentum     = momentum
+        self._alpha        = 1.0 - momentum
+        self._fwd_speed    = fwd_speed
+        self._max_lateral  = max_lateral
+        self._frame_stride = frame_stride
         self._flight_dir = flight_dir
         self._frames_dir = os.path.join(flight_dir, 'frames')
         self._depth_dir  = os.path.join(flight_dir, 'depth')
@@ -521,7 +550,7 @@ class FreeriderNode(Node):
         n   = len(buf)
         frames = []
         for i in range(N_FRAMES - 1, -1, -1):   # 2, 1, 0 → oldest to newest
-            idx = max(0, n - 1 - i * FRAME_STRIDE)
+            idx = max(0, n - 1 - i * self._frame_stride)
             frames.append(buf[idx])
         image_np = np.stack(frames, axis=0)
 
@@ -532,8 +561,8 @@ class FreeriderNode(Node):
         new_smoothed      = self._alpha * raw_action + self._momentum * smoothed_action
         new_accumulated   = accumulated_action + new_smoothed
 
-        fwd = FIXED_SPEED * max(MIN_FWD_FACTOR, 1.0 - abs(new_smoothed))
-        lat = MAX_LATERAL * new_smoothed
+        fwd = self._fwd_speed * max(MIN_FWD_FACTOR, 1.0 - abs(new_smoothed))
+        lat = self._max_lateral * new_smoothed
         if self._alt_hold and self._target_alt is not None:
             alt_err = self._target_alt - self._alt
             print(f'[ALT-DBG] target={self._target_alt:.4f} alt={self._alt:.4f} err={alt_err:.4f}', flush=True)
@@ -637,7 +666,7 @@ class FreeriderNode(Node):
         self._start_camera()
 
         latencies         = []
-        _buf_len          = (N_FRAMES - 1) * FRAME_STRIDE + 1   # = 9 at 10 Hz → 0.8 s lookback
+        _buf_len          = (N_FRAMES - 1) * self._frame_stride + 1
         frame_buffer      = deque(maxlen=_buf_len)
         smoothed          = 0.0
         accumulated_state = 0.0   # running sum of smoothed actions — state input to actor
@@ -877,10 +906,21 @@ def main():
                         help='Skip saving frames and depth JPEGs (measures pure pipeline latency)')
     parser.add_argument('--alt-hold', action='store_true',
                         help='Enable software altitude P-controller (default: rely on PX4)')
-    parser.add_argument('--momentum', type=float, default=ACTION_MOMENTUM,
-                        help=f'Action smoothing momentum 0–1 (default: {ACTION_MOMENTUM}, '
-                             f'higher = smoother/slower corrections)')
+    parser.add_argument('--preset', choices=list(PRESETS), default=DEFAULT_PRESET,
+                        help='Flight parameter preset: '
+                             'safe=1.5m/s fwd 0.8m/s lat (87%%), '
+                             'balanced=1.5m/s fwd 1.2m/s lat (87%%), '
+                             'fast=2.0m/s fwd 1.5m/s lat (90%%)')
+    parser.add_argument('--momentum', type=float, default=None,
+                        help='Action smoothing momentum 0–1 (default: from preset; '
+                             'higher = smoother/slower corrections)')
     args = parser.parse_args()
+
+    preset      = PRESETS[args.preset]
+    fwd_speed   = preset['fwd']
+    max_lateral = preset['lat']
+    frame_stride = preset['stride']
+    momentum    = args.momentum if args.momentum is not None else preset['mom']
 
     stamp      = time.strftime('%Y-%m-%d_%H-%M-%S')
     flight_dir = os.path.join(FLIGHT_LOG_ROOT, stamp)
@@ -890,6 +930,9 @@ def main():
     print('Freerider — PPO Obstacle Avoidance')
     print(f'Engine     : {args.engine}')
     print(f'Flight log : {flight_dir}')
+    print(f'Preset     : {args.preset}  '
+          f'(fwd={fwd_speed}m/s  lat={max_lateral}m/s  '
+          f'stride={frame_stride}  mom={momentum})')
     if args.sim:
         print(f'Mode       : Simulation (PX4 SITL via {SIM_FCU_URL})')
         print(f'Camera     : {args.sim_image_topic}')
@@ -897,7 +940,6 @@ def main():
         print('Mode       : Real hardware')
         print('Camera     : IMX219 fixed-focus (sensor-id=0)')
         print(f'Alt hold   : {"software P-controller" if args.alt_hold else "PX4 default"}')
-        print(f'Momentum   : {args.momentum}  (alpha={1.0 - args.momentum:.1f})')
         print('RC override: switch to ALTCTL or POSCTL at any time')
     print('=' * 60)
 
@@ -906,7 +948,10 @@ def main():
                          sim_image_topic=args.sim_image_topic,
                          no_save=args.no_save,
                          alt_hold=args.alt_hold,
-                         momentum=args.momentum)
+                         momentum=momentum,
+                         fwd_speed=fwd_speed,
+                         max_lateral=max_lateral,
+                         frame_stride=frame_stride)
     try:
         node.run()
     except KeyboardInterrupt:
